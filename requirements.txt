@@ -1,0 +1,5 @@
+radicale>=3.7,<4
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+icalendar>=5.0,<7
+python-multipart>=0.0.9,<1
