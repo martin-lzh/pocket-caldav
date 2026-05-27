@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", APP_DIR / "data")).resolve()
 COLLECTIONS_DIR = DATA_DIR / "collections"
+COLLECTION_ROOT_DIR = COLLECTIONS_DIR / "collection-root"
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
 CONFIG_DIR = DATA_DIR / "config"
 RADICALE_CONFIG_FILE = CONFIG_DIR / "radicale.conf"
@@ -95,7 +96,7 @@ class Cleaner:
 
 
 def ensure_directories() -> None:
-    for path in (DATA_DIR, COLLECTIONS_DIR, ATTACHMENTS_DIR, CONFIG_DIR):
+    for path in (DATA_DIR, COLLECTIONS_DIR, COLLECTION_ROOT_DIR, ATTACHMENTS_DIR, CONFIG_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -261,7 +262,7 @@ def storage_lock() -> Iterable[None]:
 
 
 def collection_path(owner: str, calendar: str) -> Path:
-    return COLLECTIONS_DIR / owner / calendar
+    return COLLECTION_ROOT_DIR / owner / calendar
 
 
 def event_path(owner: str, calendar: str, uid: str) -> Path:
