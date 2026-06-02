@@ -30,6 +30,48 @@ The first run creates:
 
 Use the guided CLI to create the first user and calendar. For real deployment, set explicit environment variables or manage credentials carefully on the server.
 
+## Quick Start with Docker
+
+Copy the environment template and edit the public domain:
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Start the service:
+
+```bash
+docker compose up -d --build
+docker compose logs -f caldav
+```
+
+By default, Compose binds the service to `127.0.0.1:5232` on the host and stores all server data in the named volume `caldav-data`. Put Caddy or nginx in front of it for HTTPS, then set `PUBLIC_BASE_URL` in `.env` to that external HTTPS origin.
+
+Minimal Caddy example:
+
+```text
+calendar.example.com {
+    reverse_proxy 127.0.0.1:5232
+}
+```
+
+Run the guided CLI inside the container when you need to create calendars or change saved cleanup settings:
+
+```bash
+docker compose exec caldav python server.py cli
+```
+
+If `CALDAV_API_KEY` is empty, the server generates one on first startup and stores it in the data volume. Read it with:
+
+```bash
+docker compose exec caldav cat /data/api_key.txt
+```
+
+If `CALDAV_USERS` is empty, create CalDAV users with the guided CLI. You can still set `CALDAV_API_KEY` or `CALDAV_USERS` in `.env` when you want fixed values managed by environment variables.
+
+For a direct non-proxied local test, set `HOST_BIND=0.0.0.0` in `.env` and restart the container. Do not expose plain HTTP publicly with real CalDAV passwords.
+
 ## Guided Server CLI
 
 Run this on the server:
@@ -51,27 +93,49 @@ The menu can:
 
 ## Configuration
 
-PowerShell examples:
+For a normal Docker deployment behind Caddy/nginx, the only value users must edit is `PUBLIC_BASE_URL`.
+
+Docker Compose reads these values from `.env`:
+
+| Variable | User must set? | Default/example | Purpose |
+| --- | --- | --- | --- |
+| `PUBLIC_BASE_URL` | Yes, for production | `https://calendar.example.com` | External HTTPS origin written into generated attachment URLs. Set this to your real calendar domain. |
+| `HOST_BIND` | Usually no | `127.0.0.1` | Host bind address for the Docker port mapping. Keep `127.0.0.1` when using Caddy/nginx on the same server. |
+| `HOST_PORT` | Usually no | `5232` | Host-side port used by Caddy/nginx to reach the container. Change only if `5232` is already used locally. |
+| `CALDAV_API_KEY` | No | empty | Leave empty to auto-generate `/data/api_key.txt`. Set only if you want to manage a fixed API key through `.env`. |
+| `CALDAV_USERS` | No | empty | Leave empty and create users with `python server.py cli`. Set only if you want users/passwords managed by `.env`. |
+| `ATTACHMENT_TTL_DAYS` | No | `365` | Attachment cleanup TTL. If set, it overrides the value saved by the CLI. |
+| `CLEANUP_INTERVAL_SECONDS` | No | `3600` | Attachment cleanup interval. If set, it overrides the value saved by the CLI. |
+
+The Compose file sets these internal container values automatically; users normally should not add them to `.env`:
+
+| Variable | Compose value | Purpose |
+| --- | --- | --- |
+| `DATA_DIR` | `/data` | Persistent server data inside the Docker volume. |
+| `HOST` | `0.0.0.0` | Container listen address. The host exposure is controlled by `HOST_BIND`. |
+| `PORT` | `5232` | Container listen port. The host exposure is controlled by `HOST_PORT`. |
+
+Without Docker, the script reads these environment variables directly:
+
+| Variable | Required? | Default | Notes |
+| --- | --- | --- | --- |
+| `DATA_DIR` | No | `./data` | Set this to a backed-up production path if running outside Docker. |
+| `HOST` | No | `127.0.0.1` | Keep loopback behind a reverse proxy; use `0.0.0.0` only for direct local testing. |
+| `PORT` | No | `5232` | Application listen port. |
+| `PUBLIC_BASE_URL` | Recommended for production | request base URL | Set to the external HTTPS origin so attachment URLs are stable and client-visible. |
+| `CALDAV_API_KEY` | No | generated in `data/api_key.txt` | Optional fixed management API key. |
+| `CALDAV_USERS` | No | empty | Optional fixed users. Prefer the guided CLI for user setup. |
+| `ATTACHMENT_TTL_DAYS` | No | saved setting or `365` | Overrides `data/settings.json` when present. |
+| `CLEANUP_INTERVAL_SECONDS` | No | saved setting or `3600` | Overrides `data/settings.json` when present. |
+
+`CALDAV_USERS` accepts either comma-separated `user:password` pairs or JSON:
 
 ```powershell
-$env:HOST = "0.0.0.0"
-$env:PORT = "5232"
-$env:PUBLIC_BASE_URL = "https://calendar.example.com"
-$env:CALDAV_API_KEY = "replace-with-a-long-random-api-key"
 $env:CALDAV_USERS = "main:replace-main-password"
-$env:ATTACHMENT_TTL_DAYS = "14"
-python server.py
-```
-
-`CALDAV_USERS` can also be JSON:
-
-```powershell
 $env:CALDAV_USERS = '{"main":"main-password"}'
 ```
 
 Run a single process/worker for this script. Radicale and the management API share the same filesystem storage and coordinate with Radicale's storage lock.
-
-If `ATTACHMENT_TTL_DAYS` or `CLEANUP_INTERVAL_SECONDS` are set in the environment, they override the values saved by the CLI in `data\settings.json`.
 
 ## Calendar URLs
 
@@ -189,8 +253,8 @@ Invoke-RestMethod `
 
 ## Production Notes
 
-- Put the service behind an HTTPS reverse proxy such as Caddy, nginx, or IIS ARR.
+- Put the service behind an HTTPS reverse proxy such as Caddy or nginx.
 - Set `PUBLIC_BASE_URL` to the external HTTPS origin so event attachment URLs are usable from clients.
-- Store `data` somewhere backed up and protected by filesystem permissions.
+- In Docker, back up the `caldav-data` volume. Without Docker, store `data` somewhere backed up and protected by filesystem permissions.
 - Keep `CALDAV_API_KEY` and CalDAV passwords secret.
 - Start with one worker process. If you need multi-process scaling, move management writes behind a single writer or use Radicale-native operations instead of direct filesystem writes.

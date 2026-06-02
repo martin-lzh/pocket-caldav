@@ -49,7 +49,7 @@ ATTACHMENT_INDEX_FILE = DATA_DIR / "attachments.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,199}$")
 DEFAULT_SETTINGS = {
-    "attachment_ttl_days": 14,
+    "attachment_ttl_days": 365,
     "cleanup_interval_seconds": 3600,
 }
 
