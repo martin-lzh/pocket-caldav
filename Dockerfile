@@ -6,6 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=5232
 
+LABEL org.opencontainers.image.title="Pocket CalDAV" \
+    org.opencontainers.image.description="Small self-hosted CalDAV server for personal calendars" \
+    org.opencontainers.image.licenses="MIT"
+
 WORKDIR /app
 
 RUN addgroup --system caldav \
@@ -15,7 +19,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY server.py README.md ./
+COPY server.py README.md LICENSE ./
 
 RUN mkdir -p /data \
     && chown -R caldav:caldav /app /data

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-file CalDAV bridge server backed by Radicale.
+"""Single-file personal CalDAV server backed by Radicale.
 
 The FastAPI management API writes standard iCalendar resources into
 Radicale's documented filesystem storage. Radicale serves those same files
@@ -25,12 +25,14 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
+import bcrypt
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.wsgi import WSGIMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from icalendar import Calendar
 from pydantic import BaseModel, Field
 
@@ -48,6 +50,12 @@ API_KEY_FILE = DATA_DIR / "api_key.txt"
 ATTACHMENT_INDEX_FILE = DATA_DIR / "attachments.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,199}$")
+CONTENT_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]{0,99}/[A-Za-z0-9][A-Za-z0-9.+-]{0,99}$")
+BCRYPT_HASH_RE = re.compile(r"^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$")
+MIN_API_KEY_LENGTH = 32
+DEFAULT_MAX_ICS_BYTES = 1024 * 1024
+DEFAULT_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+DEFAULT_MAX_REQUEST_BYTES = 30 * 1024 * 1024
 DEFAULT_SETTINGS = {
     "attachment_ttl_days": 365,
     "cleanup_interval_seconds": 3600,
@@ -60,6 +68,68 @@ class CalendarCreate(BaseModel):
     owner: str = Field(..., examples=["work", "main"])
     calendar: str = Field("default", examples=["default", "personal"])
     display_name: str | None = Field(None, examples=["Work"])
+
+
+class RequestBodyTooLarge(Exception):
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+
+
+class RequestBodyLimitMiddleware:
+    def __init__(self, app: Any, limits: dict[str, int]) -> None:
+        self.app = app
+        self.limits = limits
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        limit = request_body_limit(scope, self.limits)
+        content_length = header_value(scope, "content-length")
+        if content_length:
+            try:
+                if int(content_length) > limit:
+                    await send_payload_too_large(send, limit)
+                    return
+            except ValueError:
+                await send_bad_request(send, "Invalid Content-Length")
+                return
+
+        received = 0
+        response_started = False
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    raise RequestBodyTooLarge(limit)
+            return message
+
+        async def tracking_send(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except RequestBodyTooLarge as exc:
+            if response_started:
+                raise
+            await send_payload_too_large(send, exc.limit)
+
+
+class AttachmentStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: dict[str, Any]) -> Any:
+        response = await super().get_response(path, scope)
+        response.headers["Content-Disposition"] = "attachment"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
 
 class Cleaner:
@@ -114,6 +184,149 @@ def safe_filename(filename: str) -> str:
     return name[:120] or "attachment.bin"
 
 
+def safe_content_type(content_type: str | None) -> str:
+    value = (content_type or "application/octet-stream").split(";", 1)[0].strip().lower()
+    if not CONTENT_TYPE_RE.fullmatch(value):
+        return "application/octet-stream"
+    return value
+
+
+def parse_positive_int_env(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return value
+
+
+def runtime_request_limits() -> dict[str, int]:
+    attachment_limit = parse_positive_int_env(
+        "MAX_ATTACHMENT_BYTES",
+        DEFAULT_MAX_ATTACHMENT_BYTES,
+    )
+    ics_limit = parse_positive_int_env("MAX_ICS_BYTES", DEFAULT_MAX_ICS_BYTES)
+    request_limit = parse_positive_int_env(
+        "MAX_REQUEST_BYTES",
+        max(DEFAULT_MAX_REQUEST_BYTES, attachment_limit + 1024 * 1024),
+    )
+    return {
+        "attachment": attachment_limit,
+        "attachment_request": max(request_limit, attachment_limit + 1024 * 1024),
+        "ics": ics_limit,
+        "request": request_limit,
+    }
+
+
+def request_body_limit(scope: dict[str, Any], limits: dict[str, int]) -> int:
+    path = str(scope.get("path", ""))
+    method = str(scope.get("method", "")).upper()
+    if method == "POST" and re.fullmatch(r"/api/calendars/[^/]+/[^/]+/[^/]+/attachments", path):
+        return limits["attachment_request"]
+    if method == "PUT" and re.fullmatch(r"/api/calendars/[^/]+/[^/]+/[^/]+", path):
+        return limits["ics"]
+    if path.startswith("/api/"):
+        return limits["ics"]
+    return limits["request"]
+
+
+def header_value(scope: dict[str, Any], name: str) -> str | None:
+    wanted = name.lower().encode("latin-1")
+    for key, value in scope.get("headers", []):
+        if key.lower() == wanted:
+            return value.decode("latin-1")
+    return None
+
+
+async def send_plain_response(send: Any, status: int, body: str) -> None:
+    payload = body.encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"text/plain; charset=utf-8"),
+                (b"content-length", str(len(payload)).encode("ascii")),
+                (b"x-content-type-options", b"nosniff"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": payload})
+
+
+async def send_payload_too_large(send: Any, limit: int) -> None:
+    await send_plain_response(send, 413, f"Request body too large. Limit is {limit} bytes.")
+
+
+async def send_bad_request(send: Any, detail: str) -> None:
+    await send_plain_response(send, 400, detail)
+
+
+def is_bcrypt_hash(value: str) -> bool:
+    return bool(BCRYPT_HASH_RE.fullmatch(value))
+
+
+def hash_password(password: str) -> str:
+    if len(password.encode("utf-8")) > 72:
+        raise ValueError("CalDAV bcrypt passwords must be at most 72 UTF-8 bytes")
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("ascii")
+
+
+def normalize_password_secret(secret: str) -> str:
+    if is_bcrypt_hash(secret):
+        return secret
+    return hash_password(secret)
+
+
+def validate_api_key_strength(api_key: str, source: str) -> None:
+    if len(api_key) < MIN_API_KEY_LENGTH:
+        raise ValueError(f"{source} must be at least {MIN_API_KEY_LENGTH} characters")
+
+
+def public_base_url_from_env() -> str:
+    return os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+
+def public_base_hostname() -> str | None:
+    configured = public_base_url_from_env()
+    if not configured:
+        return None
+    parsed = urlparse(configured)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("PUBLIC_BASE_URL must be an absolute http(s) origin")
+    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("PUBLIC_BASE_URL must not include a path, query, or fragment")
+    if parsed.scheme != "https" and os.environ.get("ALLOW_INSECURE_PUBLIC_BASE_URL", "").lower() not in {"1", "true", "yes"}:
+        raise ValueError("PUBLIC_BASE_URL must use https unless ALLOW_INSECURE_PUBLIC_BASE_URL=true")
+    return parsed.hostname
+
+
+def allowed_hosts() -> list[str]:
+    configured = os.environ.get("ALLOWED_HOSTS", "").strip()
+    if configured:
+        hosts = [item.strip() for item in configured.split(",") if item.strip()]
+    else:
+        hosts = []
+        hostname = public_base_hostname()
+        if hostname:
+            hosts.append(hostname)
+    hosts.extend(["127.0.0.1", "localhost", "::1"])
+    return sorted(set(hosts))
+
+
+def validate_public_origin_policy() -> None:
+    if public_base_url_from_env():
+        public_base_hostname()
+        return
+    host = os.environ.get("HOST", "127.0.0.1").strip()
+    if host in {"0.0.0.0", "::"} and os.environ.get("ALLOW_REQUEST_BASE_URL", "").lower() not in {"1", "true", "yes"}:
+        raise ValueError("Set PUBLIC_BASE_URL when binding to a non-loopback host")
+
+
 def parse_users_from_env(value: str | None) -> dict[str, str]:
     if not value:
         return {}
@@ -154,15 +367,17 @@ def load_or_create_users() -> dict[str, str]:
 
 
 def write_users(users: dict[str, str]) -> None:
+    normalized: dict[str, str] = {}
     for user, password in users.items():
         validate_segment_for_startup(user, "username")
         if not isinstance(password, str) or not password:
             raise ValueError(f"password for {user!r} must be a non-empty string")
+        normalized[user] = normalize_password_secret(password)
 
-    atomic_write_text(USERS_JSON_FILE, json.dumps(users, indent=2, sort_keys=True))
+    atomic_write_text(USERS_JSON_FILE, json.dumps(normalized, indent=2, sort_keys=True) + "\n")
     atomic_write_text(
         HTPASSWD_FILE,
-        "".join(f"{username}:{password}\n" for username, password in sorted(users.items())),
+        "".join(f"{username}:{password}\n" for username, password in sorted(normalized.items())),
     )
 
 
@@ -199,10 +414,13 @@ def validate_segment_for_startup(value: str, name: str) -> None:
 def load_or_create_api_key() -> str:
     env_key = os.environ.get("CALDAV_API_KEY", "").strip()
     if env_key:
+        validate_api_key_strength(env_key, "CALDAV_API_KEY")
         atomic_write_text(API_KEY_FILE, env_key + "\n")
         return env_key
     if API_KEY_FILE.exists():
-        return API_KEY_FILE.read_text(encoding="utf-8").strip()
+        stored_key = API_KEY_FILE.read_text(encoding="utf-8").strip()
+        validate_api_key_strength(stored_key, str(API_KEY_FILE))
+        return stored_key
     key = secrets.token_urlsafe(32)
     atomic_write_text(API_KEY_FILE, key + "\n")
     return key
@@ -213,7 +431,7 @@ def write_radicale_config() -> None:
 [auth]
 type = htpasswd
 htpasswd_filename = {HTPASSWD_FILE}
-htpasswd_encryption = plain
+htpasswd_encryption = bcrypt
 delay = 1
 
 [rights]
@@ -691,9 +909,9 @@ def save_attachment_index(records: list[dict[str, Any]]) -> None:
 
 
 def public_base_url(request: Request) -> str:
-    configured = os.environ.get("PUBLIC_BASE_URL", "").strip()
+    configured = public_base_url_from_env()
     if configured:
-        return configured.rstrip("/")
+        return configured
     return str(request.base_url).rstrip("/")
 
 
@@ -721,17 +939,27 @@ async def store_uploaded_attachment(
     target = ATTACHMENTS_DIR / relative_path
     target.parent.mkdir(parents=True, exist_ok=True)
 
+    max_attachment_bytes = parse_positive_int_env("MAX_ATTACHMENT_BYTES", DEFAULT_MAX_ATTACHMENT_BYTES)
+    written = 0
     with target.open("wb") as handle:
         while True:
             chunk = await upload.read(1024 * 1024)
             if not chunk:
                 break
+            written += len(chunk)
+            if written > max_attachment_bytes:
+                handle.close()
+                delete_file_quietly(target)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Attachment too large. Limit is {max_attachment_bytes} bytes.",
+                )
             handle.write(chunk)
 
     static_path = attachment_static_path(owner, calendar_name, uid, stored_name)
     public_uri = f"{public_base_url(request)}{static_path}"
     now = datetime.now(timezone.utc).isoformat()
-    content_type = upload.content_type or "application/octet-stream"
+    content_type = safe_content_type(upload.content_type)
     with storage_lock():
         add_attachment_to_event(owner, calendar_name, uid, public_uri, content_type, original_name)
         event_end = event_end_from_ics(load_event(owner, calendar_name, uid))
@@ -1084,14 +1312,20 @@ def run_cli() -> None:
         action[1]()
 
 
-def startup_banner(users: dict[str, str], settings: dict[str, int]) -> None:
+def startup_banner(users: dict[str, str], settings: dict[str, int], limits: dict[str, int]) -> None:
     print("", flush=True)
-    print("CalDAV bridge is configured.", flush=True)
+    print("Pocket CalDAV is configured.", flush=True)
     print(f"Data directory: {DATA_DIR}", flush=True)
     print(f"Radicale config: {RADICALE_CONFIG_FILE}", flush=True)
     print(
         "Attachment cleanup: "
         f"every {settings['cleanup_interval_seconds']}s, TTL {settings['attachment_ttl_days']}d",
+        flush=True,
+    )
+    print(
+        "Request limits: "
+        f"ICS {limits['ics']} bytes, attachment {limits['attachment']} bytes, "
+        f"default {limits['request']} bytes",
         flush=True,
     )
     api_key_source = "environment" if "CALDAV_API_KEY" in os.environ else str(API_KEY_FILE)
@@ -1105,18 +1339,20 @@ def startup_banner(users: dict[str, str], settings: dict[str, int]) -> None:
     print("", flush=True)
 
 
-def prepare_runtime() -> tuple[dict[str, str], str, dict[str, int]]:
+def prepare_runtime() -> tuple[dict[str, str], str, dict[str, int], dict[str, int]]:
     ensure_directories()
+    validate_public_origin_policy()
     users = load_or_create_users()
     api_key = load_or_create_api_key()
     settings = runtime_cleanup_settings()
+    limits = runtime_request_limits()
     write_radicale_config()
-    startup_banner(users, settings)
-    return users, api_key, settings
+    startup_banner(users, settings, limits)
+    return users, api_key, settings, limits
 
 
 def create_app() -> FastAPI:
-    users, api_key, settings = prepare_runtime()
+    users, api_key, settings, limits = prepare_runtime()
     cleaner = Cleaner(
         interval_seconds=settings["cleanup_interval_seconds"],
         ttl_days=settings["attachment_ttl_days"],
@@ -1130,21 +1366,16 @@ def create_app() -> FastAPI:
         cleaner.stop()
 
     app = FastAPI(
-        title="CalDAV Subscription Server",
+        title="Pocket CalDAV",
         version="1.0.0",
         lifespan=lifespan,
     )
+    app.add_middleware(RequestBodyLimitMiddleware, limits=limits)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
-        return {
-            "ok": True,
-            "collections": str(COLLECTIONS_DIR),
-            "users": sorted(load_or_create_users().keys()),
-            "calendars": list_calendars(),
-            "ttl_days": cleaner.ttl_days,
-            "cleanup_interval_seconds": cleaner.interval_seconds,
-        }
+        return {"ok": True}
 
     @app.get("/api/bootstrap", dependencies=[Depends(require_api_key)])
     def bootstrap() -> dict[str, Any]:
@@ -1174,6 +1405,8 @@ def create_app() -> FastAPI:
         data = await request.body()
         if not data:
             raise HTTPException(status_code=400, detail="Request body must contain text/calendar data")
+        if len(data) > limits["ics"]:
+            raise HTTPException(status_code=413, detail=f"ICS too large. Limit is {limits['ics']} bytes.")
         upsert_event(owner, calendar_name, uid, data)
         return {"owner": owner, "calendar": calendar_name, "uid": uid, "path": f"/{owner}/{calendar_name}/{uid}.ics"}
 
@@ -1211,7 +1444,7 @@ def create_app() -> FastAPI:
         return cleanup_attachments(cleaner.ttl_days)
 
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    app.mount("/attachments", StaticFiles(directory=ATTACHMENTS_DIR), name="attachments")
+    app.mount("/attachments", AttachmentStaticFiles(directory=ATTACHMENTS_DIR), name="attachments")
 
     from radicale import application as radicale_application
 
@@ -1226,7 +1459,7 @@ app = None if __name__ == "__main__" else create_app()
 def main() -> None:
     import uvicorn
 
-    parser = argparse.ArgumentParser(description="CalDAV Subscription Server")
+    parser = argparse.ArgumentParser(description="Pocket CalDAV")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("serve", help="Run the CalDAV and management API server")
     subparsers.add_parser("cli", help="Open the guided server setup CLI")

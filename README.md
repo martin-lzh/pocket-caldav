@@ -1,17 +1,23 @@
-# CalDAV Subscription Server
+# Pocket CalDAV
 
-Single-file Python service that combines:
+![Pocket CalDAV logo](assets/logo.png)
+
+Pocket CalDAV is a small self-hosted CalDAV server for personal calendars.
+It keeps deployment simple by combining:
 
 - Radicale for standards-compliant CalDAV serving.
 - FastAPI management endpoints under `/api/*`.
 - Filesystem-backed attachment storage with automatic cleanup.
 
-It is designed for Apple Calendar and for Android devices that include a native CalDAV account provider. Many stock Android builds do not include native CalDAV; this server stays standards-compliant but cannot add missing OS sync-provider support on the phone.
+It is designed for Apple Calendar and for Android devices that include a native CalDAV account provider. Many stock Android builds do not include native CalDAV; Pocket CalDAV stays standards-compliant but cannot add missing OS sync-provider support on the phone.
+
+The project is intentionally compact: one Python server file, one Dockerfile,
+and persistent filesystem storage that is easy to back up.
 
 ## Quick Start on Windows
 
 ```powershell
-cd D:\projects\caldav-subscription-server
+cd D:\projects\pocket-caldav
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -28,7 +34,7 @@ The first run creates:
 - `data\collections` for Radicale calendar data.
 - `data\attachments` for uploaded event attachments.
 
-Use the guided CLI to create the first user and calendar. For real deployment, set explicit environment variables or manage credentials carefully on the server.
+Use the guided CLI to create the first user and calendar. CalDAV passwords are stored as bcrypt htpasswd hashes. For real deployment, set explicit environment variables or manage credentials carefully on the server.
 
 ## Quick Start with Docker
 
@@ -52,6 +58,9 @@ Minimal Caddy example:
 
 ```text
 calendar.example.com {
+    request_body {
+        max_size 30MB
+    }
     reverse_proxy 127.0.0.1:5232
 }
 ```
@@ -102,10 +111,14 @@ Docker Compose reads these values from `.env`:
 | `PUBLIC_BASE_URL` | Yes, for production | `https://calendar.example.com` | External HTTPS origin written into generated attachment URLs. Set this to your real calendar domain. |
 | `HOST_BIND` | Usually no | `127.0.0.1` | Host bind address for the Docker port mapping. Keep `127.0.0.1` when using Caddy/nginx on the same server. |
 | `HOST_PORT` | Usually no | `5232` | Host-side port used by Caddy/nginx to reach the container. Change only if `5232` is already used locally. |
-| `CALDAV_API_KEY` | No | empty | Leave empty to auto-generate `/data/api_key.txt`. Set only if you want to manage a fixed API key through `.env`. |
+| `ALLOWED_HOSTS` | No | empty | Optional comma-separated Host allowlist. Empty derives the public host from `PUBLIC_BASE_URL` and also allows local health checks. |
+| `CALDAV_API_KEY` | No | empty | Leave empty to auto-generate `/data/api_key.txt`. Fixed values must be at least 32 characters. |
 | `CALDAV_USERS` | No | empty | Leave empty and create users with `python server.py cli`. Set only if you want users/passwords managed by `.env`. |
 | `ATTACHMENT_TTL_DAYS` | No | `365` | Attachment cleanup TTL. If set, it overrides the value saved by the CLI. |
 | `CLEANUP_INTERVAL_SECONDS` | No | `3600` | Attachment cleanup interval. If set, it overrides the value saved by the CLI. |
+| `MAX_ICS_BYTES` | No | `1048576` | Maximum management API event body size. |
+| `MAX_ATTACHMENT_BYTES` | No | `26214400` | Maximum stored attachment size. |
+| `MAX_REQUEST_BYTES` | No | `31457280` | Default request body limit for other routes, including direct CalDAV traffic. |
 
 The Compose file sets these internal container values automatically; users normally should not add them to `.env`:
 
@@ -123,10 +136,14 @@ Without Docker, the script reads these environment variables directly:
 | `HOST` | No | `127.0.0.1` | Keep loopback behind a reverse proxy; use `0.0.0.0` only for direct local testing. |
 | `PORT` | No | `5232` | Application listen port. |
 | `PUBLIC_BASE_URL` | Recommended for production | request base URL | Set to the external HTTPS origin so attachment URLs are stable and client-visible. |
-| `CALDAV_API_KEY` | No | generated in `data/api_key.txt` | Optional fixed management API key. |
+| `ALLOWED_HOSTS` | No | derived from `PUBLIC_BASE_URL` | Optional comma-separated Host allowlist. |
+| `CALDAV_API_KEY` | No | generated in `data/api_key.txt` | Optional fixed management API key, at least 32 characters. |
 | `CALDAV_USERS` | No | empty | Optional fixed users. Prefer the guided CLI for user setup. |
 | `ATTACHMENT_TTL_DAYS` | No | saved setting or `365` | Overrides `data/settings.json` when present. |
 | `CLEANUP_INTERVAL_SECONDS` | No | saved setting or `3600` | Overrides `data/settings.json` when present. |
+| `MAX_ICS_BYTES` | No | `1048576` | Maximum management API event body size. |
+| `MAX_ATTACHMENT_BYTES` | No | `26214400` | Maximum stored attachment size. |
+| `MAX_REQUEST_BYTES` | No | `31457280` | Default request body limit for other routes. |
 
 `CALDAV_USERS` accepts either comma-separated `user:password` pairs or JSON:
 
@@ -134,6 +151,8 @@ Without Docker, the script reads these environment variables directly:
 $env:CALDAV_USERS = "main:replace-main-password"
 $env:CALDAV_USERS = '{"main":"main-password"}'
 ```
+
+When `HOST=0.0.0.0` or `HOST=::`, `PUBLIC_BASE_URL` is required unless `ALLOW_REQUEST_BASE_URL=true` is explicitly set for local testing. `PUBLIC_BASE_URL` must use HTTPS unless `ALLOW_INSECURE_PUBLIC_BASE_URL=true` is explicitly set.
 
 Run a single process/worker for this script. Radicale and the management API share the same filesystem storage and coordinate with Radicale's storage lock.
 
@@ -204,7 +223,7 @@ Create or update an event:
 $ics = @"
 BEGIN:VCALENDAR
 VERSION:2.0
-PRODID:-//Local CalDAV Bridge//EN
+PRODID:-//Pocket CalDAV//EN
 BEGIN:VEVENT
 UID:event-001
 DTSTAMP:20260526T090000Z
@@ -255,6 +274,11 @@ Invoke-RestMethod `
 
 - Put the service behind an HTTPS reverse proxy such as Caddy or nginx.
 - Set `PUBLIC_BASE_URL` to the external HTTPS origin so event attachment URLs are usable from clients.
+- Keep the reverse proxy request body limit at or below `MAX_REQUEST_BYTES`.
 - In Docker, back up the `caldav-data` volume. Without Docker, store `data` somewhere backed up and protected by filesystem permissions.
 - Keep `CALDAV_API_KEY` and CalDAV passwords secret.
 - Start with one worker process. If you need multi-process scaling, move management writes behind a single writer or use Radicale-native operations instead of direct filesystem writes.
+
+## License
+
+Pocket CalDAV is released under the MIT License. See [LICENSE](LICENSE).

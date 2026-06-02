@@ -1,17 +1,21 @@
 services:
   caldav:
     build: .
-    container_name: caldav-subscription-server
+    container_name: pocket-caldav
     restart: unless-stopped
     environment:
       DATA_DIR: /data
       HOST: 0.0.0.0
       PORT: 5232
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?Set PUBLIC_BASE_URL in .env}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
       CALDAV_API_KEY: ${CALDAV_API_KEY:-}
       CALDAV_USERS: ${CALDAV_USERS:-}
       ATTACHMENT_TTL_DAYS: ${ATTACHMENT_TTL_DAYS:-365}
       CLEANUP_INTERVAL_SECONDS: ${CLEANUP_INTERVAL_SECONDS:-3600}
+      MAX_ICS_BYTES: ${MAX_ICS_BYTES:-1048576}
+      MAX_ATTACHMENT_BYTES: ${MAX_ATTACHMENT_BYTES:-26214400}
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-31457280}
     ports:
       - "${HOST_BIND:-127.0.0.1}:${HOST_PORT:-5232}:5232"
     volumes:
