@@ -1,6 +1,6 @@
 # Pocket CalDAV
 
-![Pocket CalDAV logo](assets/logo.png)
+![Pocket CalDAV logo](assets/social-preview.png)
 
 Pocket CalDAV is a small self-hosted CalDAV server for personal calendars.
 It keeps deployment simple by combining:
