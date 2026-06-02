@@ -10,11 +10,14 @@ providers where the device/OEM includes one.
 from __future__ import annotations
 
 import asyncio
+import argparse
+import getpass
 import json
 import os
 import re
 import secrets
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -43,16 +46,12 @@ HTPASSWD_FILE = CONFIG_DIR / "users"
 USERS_JSON_FILE = DATA_DIR / "users.json"
 API_KEY_FILE = DATA_DIR / "api_key.txt"
 ATTACHMENT_INDEX_FILE = DATA_DIR / "attachments.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
 SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,199}$")
-DEFAULT_USERS = ("work", "personal", "shared", "main")
-DEFAULT_CALENDARS = (
-    ("work", "default", "Work"),
-    ("personal", "default", "Personal"),
-    ("shared", "default", "Shared"),
-    ("main", "work", "Work"),
-    ("main", "personal", "Personal"),
-    ("main", "shared", "Shared"),
-)
+DEFAULT_SETTINGS = {
+    "attachment_ttl_days": 14,
+    "cleanup_interval_seconds": 3600,
+}
 
 storage_mutex = threading.RLock()
 
@@ -149,18 +148,47 @@ def load_or_create_users() -> dict[str, str]:
     env_users = parse_users_from_env(os.environ.get("CALDAV_USERS"))
     if env_users:
         users.update(env_users)
-    elif not users:
-        users = {user: secrets.token_urlsafe(18) for user in DEFAULT_USERS}
 
-    for user in users:
+    write_users(users)
+    return users
+
+
+def write_users(users: dict[str, str]) -> None:
+    for user, password in users.items():
         validate_segment_for_startup(user, "username")
+        if not isinstance(password, str) or not password:
+            raise ValueError(f"password for {user!r} must be a non-empty string")
 
     atomic_write_text(USERS_JSON_FILE, json.dumps(users, indent=2, sort_keys=True))
     atomic_write_text(
         HTPASSWD_FILE,
         "".join(f"{username}:{password}\n" for username, password in sorted(users.items())),
     )
-    return users
+
+
+def load_settings() -> dict[str, int]:
+    settings = dict(DEFAULT_SETTINGS)
+    if SETTINGS_FILE.exists():
+        stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(stored, dict):
+            raise ValueError("settings.json must contain a JSON object")
+        settings.update(stored)
+    normalized = {
+        "attachment_ttl_days": max(1, int(settings["attachment_ttl_days"])),
+        "cleanup_interval_seconds": max(60, int(settings["cleanup_interval_seconds"])),
+    }
+    atomic_write_text(SETTINGS_FILE, json.dumps(normalized, indent=2, sort_keys=True) + "\n")
+    return normalized
+
+
+def runtime_cleanup_settings() -> dict[str, int]:
+    settings = load_settings()
+    return {
+        "attachment_ttl_days": int(os.environ.get("ATTACHMENT_TTL_DAYS", settings["attachment_ttl_days"])),
+        "cleanup_interval_seconds": int(
+            os.environ.get("CLEANUP_INTERVAL_SECONDS", settings["cleanup_interval_seconds"])
+        ),
+    }
 
 
 def validate_segment_for_startup(value: str, name: str) -> None:
@@ -206,13 +234,13 @@ mask_passwords = True
     os.environ["RADICALE_CONFIG"] = str(RADICALE_CONFIG_FILE)
 
 
-def bootstrap_default_calendars() -> None:
-    for owner, calendar, display_name in DEFAULT_CALENDARS:
-        create_calendar(owner, calendar, display_name)
-
-
 def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_text(encoding="utf-8") == content:
+        return
+    if os.name == "nt":
+        path.write_text(content, encoding="utf-8", newline="\n")
+        return
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as tmp:
@@ -220,11 +248,19 @@ def atomic_write_text(path: Path, content: str) -> None:
         os.replace(tmp_name, path)
     finally:
         if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+            try:
+                os.unlink(tmp_name)
+            except PermissionError:
+                pass
 
 
 def atomic_write_bytes(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_bytes() == content:
+        return
+    if os.name == "nt":
+        path.write_bytes(content)
+        return
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as tmp:
@@ -232,7 +268,10 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
         os.replace(tmp_name, path)
     finally:
         if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+            try:
+                os.unlink(tmp_name)
+            except PermissionError:
+                pass
 
 
 @contextmanager
@@ -280,6 +319,244 @@ def create_calendar(owner: str, calendar: str, display_name: str | None = None) 
         path.mkdir(parents=True, exist_ok=True)
         atomic_write_text(path / ".Radicale.props", json.dumps(props, sort_keys=True))
     return path
+
+
+def list_calendars() -> list[dict[str, str]]:
+    calendars: list[dict[str, str]] = []
+    if not COLLECTION_ROOT_DIR.exists():
+        return calendars
+    for props_file in COLLECTION_ROOT_DIR.glob("*/*/.Radicale.props"):
+        try:
+            props = json.loads(props_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            props = {}
+        owner = props_file.parent.parent.name
+        calendar_name = props_file.parent.name
+        calendars.append(
+            {
+                "owner": owner,
+                "calendar": calendar_name,
+                "display_name": str(props.get("D:displayname") or calendar_name),
+                "path": f"/{owner}/{calendar_name}/",
+            }
+        )
+    return sorted(calendars, key=lambda item: (item["owner"], item["calendar"]))
+
+
+def path_is_within(path: Path, base: Path) -> bool:
+    resolved_path = path.resolve()
+    resolved_base = base.resolve()
+    return resolved_path == resolved_base or resolved_base in resolved_path.parents
+
+
+def remove_tree_under(base: Path, path: Path) -> None:
+    if not path.exists():
+        return
+    if not path_is_within(path, base):
+        raise ValueError(f"Refusing to delete path outside {base}: {path}")
+    shutil.rmtree(path)
+
+
+def delete_managed_attachments_for_owner(owner: str) -> int:
+    records = load_attachment_index()
+    kept: list[dict[str, Any]] = []
+    deleted = 0
+    for record in records:
+        if record.get("owner") == owner:
+            path = (ATTACHMENTS_DIR / str(record.get("relative_path", ""))).resolve()
+            if path_is_within(path, ATTACHMENTS_DIR):
+                delete_file_quietly(path)
+                delete_empty_parents(path)
+            deleted += 1
+        else:
+            kept.append(record)
+    save_attachment_index(kept)
+    return deleted
+
+
+def rewrite_attachment_uri_owner(uri: str, source_owner: str, target_owner: str) -> str:
+    marker = "/attachments/"
+    if marker not in uri:
+        return uri
+    prefix, rest = uri.split(marker, 1)
+    parts = rest.split("/", 1)
+    if not parts or parts[0] != quote(source_owner, safe=""):
+        return uri
+    suffix = parts[1] if len(parts) > 1 else ""
+    return f"{prefix}{marker}{quote(target_owner, safe='')}/{suffix}"
+
+
+def validate_attachment_migration_targets(source_owner: str, target_owner: str) -> None:
+    for record in load_attachment_index():
+        if record.get("owner") != source_owner:
+            continue
+        old_relative = Path(str(record.get("relative_path", "")))
+        if not old_relative.parts:
+            continue
+        old_path = (ATTACHMENTS_DIR / old_relative).resolve()
+        new_relative = Path(target_owner).joinpath(*old_relative.parts[1:])
+        new_path = (ATTACHMENTS_DIR / new_relative).resolve()
+        if not path_is_within(old_path, ATTACHMENTS_DIR):
+            raise ValueError(f"Refusing to move attachment outside {ATTACHMENTS_DIR}: {old_path}")
+        if not path_is_within(new_path, ATTACHMENTS_DIR):
+            raise ValueError(f"Refusing to move attachment outside {ATTACHMENTS_DIR}: {new_path}")
+        if old_path.exists() and new_path.exists():
+            raise ValueError(f"Target attachment path already exists: {new_path}")
+
+
+def migrate_managed_attachments_owner(source_owner: str, target_owner: str) -> dict[str, int]:
+    records = load_attachment_index()
+    migrated = 0
+    rewritten_uris = 0
+    for record in records:
+        if record.get("owner") != source_owner:
+            continue
+        old_relative = Path(str(record.get("relative_path", "")))
+        if not old_relative.parts:
+            continue
+        old_path = (ATTACHMENTS_DIR / old_relative).resolve()
+        new_relative = Path(target_owner).joinpath(*old_relative.parts[1:])
+        new_path = (ATTACHMENTS_DIR / new_relative).resolve()
+        if path_is_within(old_path, ATTACHMENTS_DIR) and old_path.exists():
+            if not path_is_within(new_path, ATTACHMENTS_DIR):
+                raise ValueError(f"Refusing to move attachment outside {ATTACHMENTS_DIR}: {new_path}")
+            if new_path.exists():
+                raise ValueError(f"Target attachment path already exists: {new_path}")
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old_path), str(new_path))
+            delete_empty_parents(old_path)
+        record["owner"] = target_owner
+        record["relative_path"] = new_relative.as_posix()
+        old_uri = str(record.get("uri", ""))
+        new_uri = rewrite_attachment_uri_owner(old_uri, source_owner, target_owner)
+        if new_uri != old_uri:
+            record["uri"] = new_uri
+            rewritten_uris += 1
+        migrated += 1
+    save_attachment_index(records)
+    return {"attachments_migrated": migrated, "attachment_uris_rewritten": rewritten_uris}
+
+
+def rewrite_calendar_attachment_uris(source_owner: str, target_owner: str) -> int:
+    rewritten = 0
+    owner_root = COLLECTION_ROOT_DIR / target_owner
+    if not owner_root.exists():
+        return 0
+    for event_file in owner_root.glob("*/*.ics"):
+        calendar = parse_calendar(event_file.read_bytes())
+        event = list(calendar.walk("VEVENT"))[0]
+        attachments = event.get("ATTACH")
+        if attachments is None:
+            continue
+        if not isinstance(attachments, list):
+            attachments = [attachments]
+        changed = False
+        for item in attachments:
+            uri = str(item)
+            new_uri = rewrite_attachment_uri_owner(uri, source_owner, target_owner)
+            if new_uri != uri:
+                changed = True
+                rewritten += 1
+        if changed:
+            event.pop("ATTACH", None)
+            for item in attachments:
+                uri = str(item)
+                new_uri = rewrite_attachment_uri_owner(uri, source_owner, target_owner)
+                if new_uri != uri:
+                    params = dict(getattr(item, "params", {}))
+                    event.add("ATTACH", new_uri, parameters=params)
+                else:
+                    event.add("ATTACH", item, encode=0)
+            atomic_write_bytes(event_file, calendar.to_ical())
+    return rewritten
+
+
+def migrate_user_data(source_owner: str, target_owner: str) -> dict[str, int]:
+    validate_segment_for_startup(source_owner, "source owner")
+    validate_segment_for_startup(target_owner, "target owner")
+    if source_owner == target_owner:
+        raise ValueError("source and target users must be different")
+
+    migrated_calendars = 0
+    with storage_lock():
+        source_root = COLLECTION_ROOT_DIR / source_owner
+        target_root = COLLECTION_ROOT_DIR / target_owner
+        legacy_source_root = COLLECTIONS_DIR / source_owner
+        legacy_target_root = COLLECTIONS_DIR / target_owner
+        if source_root.exists():
+            for calendar_dir in source_root.iterdir():
+                if not calendar_dir.is_dir():
+                    continue
+                target_dir = target_root / calendar_dir.name
+                if target_dir.exists():
+                    raise ValueError(
+                        f"Target user already has calendar {calendar_dir.name!r}; rename or remove it first"
+                    )
+        if legacy_source_root.exists() and legacy_target_root.exists():
+            raise ValueError(f"Target legacy collection path already exists: {legacy_target_root}")
+        validate_attachment_migration_targets(source_owner, target_owner)
+
+        if source_root.exists():
+            target_root.mkdir(parents=True, exist_ok=True)
+            for calendar_dir in source_root.iterdir():
+                if calendar_dir.is_dir():
+                    shutil.move(str(calendar_dir), str(target_root / calendar_dir.name))
+                    migrated_calendars += 1
+            remove_tree_under(COLLECTION_ROOT_DIR, source_root)
+
+        if legacy_source_root.exists():
+            legacy_target_root.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy_source_root), str(legacy_target_root))
+
+        attachment_migration = migrate_managed_attachments_owner(source_owner, target_owner)
+        event_uris_rewritten = rewrite_calendar_attachment_uris(source_owner, target_owner)
+
+    return {
+        "calendars_migrated": migrated_calendars,
+        **attachment_migration,
+        "event_attachment_uris_rewritten": event_uris_rewritten,
+    }
+
+
+def delete_user(username: str, mode: str, target_user: str | None = None) -> dict[str, Any]:
+    validate_segment_for_startup(username, "username")
+    if mode not in {"delete", "migrate"}:
+        raise ValueError("mode must be 'delete' or 'migrate'")
+    users = load_or_create_users()
+    if mode == "migrate":
+        if not target_user:
+            raise ValueError("target_user is required for migration")
+        validate_segment_for_startup(target_user, "target username")
+        if target_user not in users:
+            raise ValueError(f"target user does not exist: {target_user}")
+        migration = migrate_user_data(username, target_user)
+    else:
+        migration = {
+            "calendars_migrated": 0,
+            "attachments_migrated": 0,
+            "attachment_uris_rewritten": 0,
+            "event_attachment_uris_rewritten": 0,
+        }
+
+    existed = username in users
+    if existed:
+        del users[username]
+        write_users(users)
+
+    result: dict[str, Any] = {
+        "user_deleted": existed,
+        "mode": mode,
+        "data_deleted": False,
+        "attachments_deleted": 0,
+        **migration,
+    }
+    if mode == "delete":
+        with storage_lock():
+            result["attachments_deleted"] = delete_managed_attachments_for_owner(username)
+            remove_tree_under(COLLECTION_ROOT_DIR, COLLECTION_ROOT_DIR / username)
+            remove_tree_under(COLLECTIONS_DIR, COLLECTIONS_DIR / username)
+        result["data_deleted"] = True
+    return result
 
 
 def parse_calendar(data: bytes) -> Calendar:
@@ -586,35 +863,263 @@ def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key")
 
 
-def startup_banner(users: dict[str, str], api_key: str) -> None:
+def prompt_text(label: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    value = input(f"{label}{suffix}: ").strip()
+    return value or (default or "")
+
+
+def prompt_yes_no(label: str, default: bool = False) -> bool:
+    default_text = "Y/n" if default else "y/N"
+    while True:
+        answer = input(f"{label} [{default_text}]: ").strip().lower()
+        if not answer:
+            return default
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Please answer y or n.")
+
+
+def prompt_positive_int(label: str, default: int, minimum: int = 1) -> int:
+    while True:
+        raw = prompt_text(label, str(default))
+        try:
+            value = int(raw)
+        except ValueError:
+            print("Please enter a whole number.")
+            continue
+        if value < minimum:
+            print(f"Please enter a value >= {minimum}.")
+            continue
+        return value
+
+
+def prompt_segment(label: str, default: str | None = None) -> str:
+    while True:
+        value = prompt_text(label, default)
+        try:
+            validate_segment_for_startup(value, label)
+        except ValueError as exc:
+            print(exc)
+            continue
+        return value
+
+
+def prompt_password() -> str:
+    generated = secrets.token_urlsafe(18)
+    if prompt_yes_no("Generate a random password", True):
+        return generated
+    while True:
+        first = getpass.getpass("Password: ")
+        second = getpass.getpass("Confirm password: ")
+        if first and first == second:
+            return first
+        print("Passwords must be non-empty and match.")
+
+
+def print_cli_status() -> None:
+    users = load_or_create_users()
+    settings = load_settings()
+    calendars = list_calendars()
+    print("")
+    print(f"Data directory: {DATA_DIR}")
+    print(f"Users: {', '.join(sorted(users)) if users else '(none)'}")
+    print("Calendars:")
+    if calendars:
+        for item in calendars:
+            print(f"  {item['path']} ({item['display_name']})")
+    else:
+        print("  (none)")
+    print(
+        "Attachment cleanup: "
+        f"every {settings['cleanup_interval_seconds']}s, TTL {settings['attachment_ttl_days']}d"
+    )
+    print(f"Management API key file: {API_KEY_FILE}")
+    print("")
+
+
+def cli_add_or_update_user() -> None:
+    users = load_or_create_users()
+    username = prompt_segment("Username")
+    replacing = username in users
+    password = prompt_password()
+    users[username] = password
+    write_users(users)
+    print(f"{'Updated' if replacing else 'Created'} user: {username}")
+    print(f"Password: {password}")
+
+
+def cli_delete_user() -> None:
+    users = load_or_create_users()
+    if not users:
+        print("No users exist.")
+        return
+    print(f"Existing users: {', '.join(sorted(users))}")
+    username = prompt_segment("Username to delete")
+    if username not in users:
+        print(f"User does not exist: {username}")
+        return
+    env_users = parse_users_from_env(os.environ.get("CALDAV_USERS"))
+    if username in env_users:
+        print("This user is also present in CALDAV_USERS and will come back while that environment variable is set.")
+
+    print("")
+    print("User data must be handled before the account is removed:")
+    print("1. Migrate calendars and managed attachments to another user")
+    print("2. Permanently delete calendars and managed attachments")
+    print("0. Cancel")
+    action = input("Choose: ").strip()
+    if action == "0":
+        print("Canceled.")
+        return
+    if action == "1":
+        targets = sorted(user for user in users if user != username)
+        if not targets:
+            print("No other users exist. Create the destination user first.")
+            return
+        print(f"Available target users: {', '.join(targets)}")
+        target_user = prompt_segment("Target username")
+        if target_user == username:
+            print("Target user must be different from the deleted user.")
+            return
+        if target_user not in users:
+            print(f"Target user does not exist: {target_user}")
+            return
+        if not prompt_yes_no(f"Migrate {username}'s data to {target_user} and delete {username}", False):
+            print("Canceled.")
+            return
+        result = delete_user(username, "migrate", target_user)
+    elif action == "2":
+        if not prompt_yes_no(f"Permanently delete {username}'s account, calendars, and managed attachments", False):
+            print("Canceled.")
+            return
+        result = delete_user(username, "delete")
+    else:
+        print("Unknown option.")
+        return
+
+    print(
+        f"Deleted user={result['user_deleted']}, "
+        f"mode={result['mode']}, "
+        f"calendars_migrated={result['calendars_migrated']}, "
+        f"attachments_migrated={result['attachments_migrated']}, "
+        f"attachment_uris_rewritten={result['attachment_uris_rewritten']}, "
+        f"event_attachment_uris_rewritten={result['event_attachment_uris_rewritten']}, "
+        f"deleted_data={result['data_deleted']}, "
+        f"deleted_attachments={result['attachments_deleted']}"
+    )
+
+
+def cli_create_calendar() -> None:
+    users = load_or_create_users()
+    if users:
+        print(f"Existing users: {', '.join(sorted(users))}")
+    else:
+        print("No users exist yet. Create a user first, then create calendars for it.")
+        return
+    owner = prompt_segment("Owner username")
+    if owner not in users and not prompt_yes_no("Owner is not a configured user. Create calendar anyway", False):
+        print("Canceled.")
+        return
+    calendar_name = prompt_segment("Calendar name", "default")
+    display_name = prompt_text("Display name", calendar_name)
+    create_calendar(owner, calendar_name, display_name)
+    print(f"Calendar URL path: /{owner}/{calendar_name}/")
+
+
+def cli_configure_cleanup() -> None:
+    settings = load_settings()
+    ttl_days = prompt_positive_int("Attachment TTL days", settings["attachment_ttl_days"], minimum=1)
+    interval_seconds = prompt_positive_int(
+        "Cleanup interval seconds",
+        settings["cleanup_interval_seconds"],
+        minimum=60,
+    )
+    settings = {
+        "attachment_ttl_days": ttl_days,
+        "cleanup_interval_seconds": interval_seconds,
+    }
+    atomic_write_text(SETTINGS_FILE, json.dumps(settings, indent=2, sort_keys=True) + "\n")
+    print(f"Saved cleanup settings to {SETTINGS_FILE}")
+    if "ATTACHMENT_TTL_DAYS" in os.environ or "CLEANUP_INTERVAL_SECONDS" in os.environ:
+        print("Environment variables still override these settings when the server starts.")
+
+
+def cli_run_cleanup() -> None:
+    settings = runtime_cleanup_settings()
+    result = cleanup_attachments(settings["attachment_ttl_days"])
+    print(f"Deleted {result['deleted']} attachment(s); {result['remaining']} remaining.")
+
+
+def run_cli() -> None:
+    ensure_directories()
+    load_or_create_users()
+    load_or_create_api_key()
+    load_settings()
+    write_radicale_config()
+    actions = {
+        "1": ("Show current status", print_cli_status),
+        "2": ("Create or update user", cli_add_or_update_user),
+        "3": ("Delete user", cli_delete_user),
+        "4": ("Create calendar for user", cli_create_calendar),
+        "5": ("Configure attachment cleanup", cli_configure_cleanup),
+        "6": ("Run attachment cleanup now", cli_run_cleanup),
+    }
+    while True:
+        print("")
+        print("CalDAV server setup")
+        for key, (label, _handler) in actions.items():
+            print(f"{key}. {label}")
+        print("0. Exit")
+        choice = input("Choose: ").strip()
+        if choice == "0":
+            return
+        action = actions.get(choice)
+        if not action:
+            print("Unknown option.")
+            continue
+        print("")
+        action[1]()
+
+
+def startup_banner(users: dict[str, str], settings: dict[str, int]) -> None:
     print("", flush=True)
     print("CalDAV bridge is configured.", flush=True)
     print(f"Data directory: {DATA_DIR}", flush=True)
     print(f"Radicale config: {RADICALE_CONFIG_FILE}", flush=True)
-    if "CALDAV_API_KEY" not in os.environ:
-        print(f"Generated API key: {api_key}", flush=True)
-    if "CALDAV_USERS" not in os.environ:
-        print("Generated CalDAV users:", flush=True)
-        for username, password in sorted(users.items()):
-            print(f"  {username}: {password}", flush=True)
+    print(
+        "Attachment cleanup: "
+        f"every {settings['cleanup_interval_seconds']}s, TTL {settings['attachment_ttl_days']}d",
+        flush=True,
+    )
+    api_key_source = "environment" if "CALDAV_API_KEY" in os.environ else str(API_KEY_FILE)
+    print(f"Management API key source: {api_key_source}", flush=True)
+    if users:
+        print("CalDAV users:", flush=True)
+        for username in sorted(users):
+            print(f"  {username}", flush=True)
+    else:
+        print("No CalDAV users are configured. Run `python server.py cli` to add one.", flush=True)
     print("", flush=True)
 
 
-def prepare_runtime() -> tuple[dict[str, str], str]:
+def prepare_runtime() -> tuple[dict[str, str], str, dict[str, int]]:
     ensure_directories()
     users = load_or_create_users()
     api_key = load_or_create_api_key()
+    settings = runtime_cleanup_settings()
     write_radicale_config()
-    bootstrap_default_calendars()
-    startup_banner(users, api_key)
-    return users, api_key
+    startup_banner(users, settings)
+    return users, api_key, settings
 
 
 def create_app() -> FastAPI:
-    users, api_key = prepare_runtime()
+    users, api_key, settings = prepare_runtime()
     cleaner = Cleaner(
-        interval_seconds=int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "3600")),
-        ttl_days=int(os.environ.get("ATTACHMENT_TTL_DAYS", "14")),
+        interval_seconds=settings["cleanup_interval_seconds"],
+        ttl_days=settings["attachment_ttl_days"],
     )
 
     @asynccontextmanager
@@ -635,18 +1140,17 @@ def create_app() -> FastAPI:
         return {
             "ok": True,
             "collections": str(COLLECTIONS_DIR),
-            "users": sorted(users.keys()),
+            "users": sorted(load_or_create_users().keys()),
+            "calendars": list_calendars(),
             "ttl_days": cleaner.ttl_days,
+            "cleanup_interval_seconds": cleaner.interval_seconds,
         }
 
     @app.get("/api/bootstrap", dependencies=[Depends(require_api_key)])
     def bootstrap() -> dict[str, Any]:
         return {
-            "users": sorted(users.keys()),
-            "collections": [
-                {"owner": owner, "calendar": calendar}
-                for owner, calendar, _display_name in DEFAULT_CALENDARS
-            ],
+            "users": sorted(load_or_create_users().keys()),
+            "calendars": list_calendars(),
             "api_key_source": "environment" if "CALDAV_API_KEY" in os.environ else str(API_KEY_FILE),
         }
 
@@ -716,12 +1220,25 @@ def create_app() -> FastAPI:
     return app
 
 
-app = create_app()
+app = None if __name__ == "__main__" else create_app()
 
 
 def main() -> None:
     import uvicorn
 
+    parser = argparse.ArgumentParser(description="CalDAV Subscription Server")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("serve", help="Run the CalDAV and management API server")
+    subparsers.add_parser("cli", help="Open the guided server setup CLI")
+    args = parser.parse_args()
+
+    if args.command == "cli":
+        run_cli()
+        return
+
+    global app
+    if app is None:
+        app = create_app()
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5232"))
     uvicorn.run(app, host=host, port=port, reload=False)

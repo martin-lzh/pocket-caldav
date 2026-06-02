@@ -16,17 +16,38 @@ py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+python server.py cli
 python server.py
 ```
 
 The first run creates:
 
-- `data\users.json` with generated CalDAV usernames and passwords.
+- `data\users.json` for CalDAV usernames and passwords. It starts empty unless `CALDAV_USERS` is set.
 - `data\api_key.txt` with a generated management API key.
+- `data\settings.json` with attachment cleanup settings.
 - `data\collections` for Radicale calendar data.
 - `data\attachments` for uploaded event attachments.
 
-The generated credentials are printed on startup. For real deployment, set explicit environment variables instead of relying on generated development credentials.
+Use the guided CLI to create the first user and calendar. For real deployment, set explicit environment variables or manage credentials carefully on the server.
+
+## Guided Server CLI
+
+Run this on the server:
+
+```powershell
+python server.py cli
+```
+
+The menu can:
+
+- Show configured users, calendars, and cleanup settings.
+- Create or update a CalDAV user.
+- Delete an old user by either migrating that user's calendars and managed attachments to another user or permanently deleting them.
+- Create a calendar for a user.
+- Set the attachment cleanup TTL and cleanup interval.
+- Run attachment cleanup immediately.
+
+`python server.py` and `python server.py serve` both start the CalDAV server.
 
 ## Configuration
 
@@ -37,7 +58,7 @@ $env:HOST = "0.0.0.0"
 $env:PORT = "5232"
 $env:PUBLIC_BASE_URL = "https://calendar.example.com"
 $env:CALDAV_API_KEY = "replace-with-a-long-random-api-key"
-$env:CALDAV_USERS = "work:replace-work-password,personal:replace-personal-password,shared:replace-shared-password,main:replace-main-password"
+$env:CALDAV_USERS = "main:replace-main-password"
 $env:ATTACHMENT_TTL_DAYS = "14"
 python server.py
 ```
@@ -45,10 +66,12 @@ python server.py
 `CALDAV_USERS` can also be JSON:
 
 ```powershell
-$env:CALDAV_USERS = '{"work":"work-password","personal":"personal-password","shared":"shared-password","main":"main-password"}'
+$env:CALDAV_USERS = '{"main":"main-password"}'
 ```
 
 Run a single process/worker for this script. Radicale and the management API share the same filesystem storage and coordinate with Radicale's storage lock.
+
+If `ATTACHMENT_TTL_DAYS` or `CLEANUP_INTERVAL_SECONDS` are set in the environment, they override the values saved by the CLI in `data\settings.json`.
 
 ## Calendar URLs
 
@@ -56,6 +79,14 @@ Local development base URL:
 
 ```text
 http://127.0.0.1:5232
+```
+
+One-user, multiple-calendar layout:
+
+```text
+http://127.0.0.1:5232/main/work/
+http://127.0.0.1:5232/main/personal/
+http://127.0.0.1:5232/main/shared/
 ```
 
 Separate-user layout:
@@ -66,13 +97,7 @@ http://127.0.0.1:5232/personal/default/
 http://127.0.0.1:5232/shared/default/
 ```
 
-One-user slot layout:
-
-```text
-http://127.0.0.1:5232/main/work/
-http://127.0.0.1:5232/main/personal/
-http://127.0.0.1:5232/main/shared/
-```
+No default calendars are created automatically. Create the users and calendars you actually need with `python server.py cli` or the management API.
 
 For Apple Calendar on iOS/macOS:
 
