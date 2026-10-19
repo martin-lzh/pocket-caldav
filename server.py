@@ -9,7 +9,6 @@ providers where the device/OEM includes one.
 
 from __future__ import annotations
 
-import asyncio
 import argparse
 import base64
 import calendar as calendar_module
@@ -21,10 +20,8 @@ import re
 import secrets
 import shutil
 import sqlite3
-import sys
 import tempfile
 import threading
-import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager, contextmanager
