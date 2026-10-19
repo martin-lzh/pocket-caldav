@@ -5,3 +5,4 @@ venv/
 data/
 .smoke-data/
 .env
+.pytest_cache/

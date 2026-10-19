@@ -1,6 +1,8 @@
-radicale>=3.7,<4
+radicale>=3.7.8,<4
 fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1
-icalendar>=5.0,<7
+icalendar>=6.0,<7
+recurring-ical-events>=3.3,<4
+python-dateutil>=2.8,<3
 python-multipart>=0.0.27,<1
 bcrypt>=4.1,<6
