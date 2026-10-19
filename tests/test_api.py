@@ -405,10 +405,11 @@ def test_attachment_lifecycle(client, calendar):
 
 def test_cleanup_is_gated_and_keeps_attachments_of_running_series(client, calendar):
     # A series that started in the past but runs until 2099 must keep its attachment.
-    too_long = ics("series-att", "DTSTART:20200101T090000Z", "DTEND:20200101T100000Z", "RRULE:FREQ=DAILY;UNTIL=20991231T000000Z")
+    too_long = ics("series-att", "DTSTART:20200101T090000Z", "DTEND:20200101T100000Z", "RRULE:FREQ=DAILY;COUNT=150000")
     rejected = put(client, calendar, "series-att", too_long)
     assert rejected.status_code == 400 and "CalDAV clients could not load" in rejected.json()["detail"]
-    body = ics("series-att", "DTSTART:20200101T090000Z", "DTEND:20200101T100000Z", "RRULE:FREQ=WEEKLY;UNTIL=20991231T000000Z", "SUMMARY:s")
+    # About 29,000 instances: above Radicale's default limit, accepted with the raised one.
+    body = ics("series-att", "DTSTART:20200101T090000Z", "DTEND:20200101T100000Z", "RRULE:FREQ=DAILY;UNTIL=20991231T000000Z", "SUMMARY:s")
     assert put(client, calendar, "series-att", body).status_code == 200
     client.post(f"{base(calendar)}/series-att/attachments", files={"file": ("a.txt", b"a", "text/plain")})
     put(client, calendar, "past-att", simple("past-att", "20200101T090000Z", "20200101T100000Z"))

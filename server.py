@@ -15,6 +15,7 @@ import calendar as calendar_module
 import getpass
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -64,6 +65,7 @@ API_KEY_FILE = DATA_DIR / "api_key.txt"
 ATTACHMENT_INDEX_FILE = DATA_DIR / "attachments.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 JOURNAL_FILE = DATA_DIR / "journal.sqlite3"
+EXPORTS_DIR = DATA_DIR / "exports"
 SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,199}$")
 CONTENT_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]{0,99}/[A-Za-z0-9][A-Za-z0-9.+-]{0,99}$")
 BCRYPT_HASH_RE = re.compile(r"^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$")
@@ -79,7 +81,9 @@ DEFAULT_LIST_LIMIT = 200
 MAX_LIST_LIMIT = 1000
 MAX_BATCH_OPERATIONS = 500
 MAX_EXPANDED_INSTANCES = 50000
-RADICALE_MAX_RRULE_OCCURRENCES = 10000
+# Radicale silently hides items whose finite RRULE exceeds this many instances;
+# the default (10000) rejects e.g. a daily series running 30 years.
+RADICALE_MAX_RRULE_OCCURRENCES = 100000
 # Floating and all-day values are compared in a caller-chosen zone, which can
 # differ from the library's notion by up to a day; widen scans by this margin.
 RECURRENCE_SCAN_MARGIN = timedelta(days=2)
@@ -224,6 +228,7 @@ class ChangeEntry(BaseModel):
 
 
 class ChangesResponse(BaseModel):
+    warnings: list[str] = Field(default_factory=list, description="Set when the journal failed to record writes; affected changes appear later as `external`.")
     changes: list[ChangeEntry]
     next_token: str = Field(..., description="Pass as `since` to receive only later changes.")
     truncated: bool = Field(..., description="True when more changes are available right away with next_token.")
@@ -303,6 +308,7 @@ class BatchResponse(BaseModel):
     failed_index: int | None = None
     results: list[BatchOperationResult]
     skipped_components: list[dict[str, Any]] = Field(default_factory=list)
+    error: str | None = Field(None, description="Only on 500: the storage write failed and was rolled back.")
 
 
 class ValidateRequest(BaseModel):
@@ -340,6 +346,20 @@ class CleanupResult(BaseModel):
     attachments: list[dict[str, Any]] | None = Field(None, description="Attachments that would be deleted (dry run only).")
 
 
+class ErrorInfo(BaseModel):
+    code: str = Field(..., description="Stable machine-readable code, e.g. event_not_found, duplicate_event, precondition_failed.")
+    message: str
+    status: int
+    retryable: bool = Field(..., description="True when the same request can succeed later (412 after re-reading, 5xx).")
+    hint: str | None = Field(None, description="What to do next.")
+    details: dict[str, Any] | None = None
+
+
+class ErrorResponse(BaseModel):
+    detail: Any = Field(..., description="Human-readable message (a list of field errors for 422), kept for compatibility.")
+    error: ErrorInfo
+
+
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {"description": "Invalid input."},
     401: {"description": "Missing or invalid X-API-Key."},
@@ -353,7 +373,25 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 
 
 def error_responses(*codes: int) -> dict[int | str, dict[str, Any]]:
-    return {code: ERROR_RESPONSES[code] for code in (401, *codes)}
+    return {code: {**ERROR_RESPONSES[code], "model": ErrorResponse} for code in (401, *codes)}
+
+
+def batch_error_responses(*codes: int) -> dict[int | str, dict[str, Any]]:
+    """Batch-style endpoints answer a failed operation with the full per-operation report."""
+    responses = error_responses(*codes)
+    for code in codes:
+        if code in (400, 404, 409, 412, 413):
+            responses[code] = {
+                "description": f"{ERROR_RESPONSES[code]['description']} When an operation fails, the body is a BatchResponse "
+                               "with applied=false and failed_index; request-level errors use ErrorResponse.",
+                "content": {"application/json": {"schema": {"anyOf": [
+                    {"$ref": "#/components/schemas/BatchResponse"},
+                    {"$ref": "#/components/schemas/ErrorResponse"},
+                ]}}},
+            }
+    responses[500] = {"description": "A write failed and every change was rolled back (BatchResponse with `error`).",
+                      "model": BatchResponse}
+    return responses
 
 
 ICS_REQUEST_BODY = {
@@ -523,7 +561,7 @@ def request_body_limit(scope: dict[str, Any], limits: dict[str, int]) -> int:
         return limits["attachment_request"]
     if method == "PUT" and re.fullmatch(r"/api/calendars/[^/]+/[^/]+/[^/]+", path):
         return limits["ics"]
-    if method == "POST" and (path == "/api/batch" or re.fullmatch(r"/api/calendars/[^/]+/[^/]+/import", path)):
+    if method == "POST" and (path in {"/api/batch", "/api/restore"} or re.fullmatch(r"/api/calendars/[^/]+/[^/]+/import", path)):
         return limits["request"]
     if method == "POST" and path == "/api/validate":
         # JSON string escaping can double the size of an ICS body.
@@ -727,6 +765,9 @@ def load_or_create_api_key() -> str:
 
 def write_radicale_config() -> None:
     config = f"""
+[server]
+max_vevent_rrule_occurrence = {RADICALE_MAX_RRULE_OCCURRENCES}
+
 [auth]
 type = htpasswd
 htpasswd_filename = {HTPASSWD_FILE}
@@ -1166,9 +1207,31 @@ def attach_values(component: Any) -> list[Any]:
     return attachments if isinstance(attachments, list) else [attachments]
 
 
+def degenerate_rrule_errors(calendar: Calendar) -> list[str]:
+    """RRULEs that make recurrence libraries loop forever (e.g. INTERVAL=0)."""
+    problems: list[str] = []
+    for event in calendar.walk("VEVENT"):
+        for rule in listify(event.get("RRULE")):
+            for key in ("INTERVAL", "COUNT"):
+                for value in rule.get(key, []):
+                    try:
+                        number = int(value)
+                    except (TypeError, ValueError):
+                        number = 0
+                    if number < 1:
+                        problems.append(f"RRULE {key} must be a positive integer, got {value!r}")
+    return problems
+
+
+def listify(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
 def normalize_calendar(data: bytes, expected_uid: str) -> bytes:
     calendar = parse_calendar(data)
-    problems = property_parse_errors(calendar)
+    problems = property_parse_errors(calendar) + degenerate_rrule_errors(calendar)
     if problems:
         # The parser would silently drop these properties; refuse instead of losing data.
         raise HTTPException(status_code=400, detail="Invalid iCalendar data: " + "; ".join(problems[:5]))
@@ -1183,17 +1246,40 @@ def normalize_calendar(data: bytes, expected_uid: str) -> bytes:
     return calendar.to_ical()
 
 
+class _ValidationLogFilter(logging.Filter):
+    """Drop Radicale log records emitted while we validate, so UIDs and rules stay out of logs."""
+
+    active = threading.local()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(self.active, "on", False)
+
+
+_validation_log_filter = _ValidationLogFilter()
+logging.getLogger("radicale").addFilter(_validation_log_filter)
+
+
+@contextmanager
+def quiet_radicale_logger() -> Iterable[None]:
+    _ValidationLogFilter.active.on = True
+    try:
+        yield
+    finally:
+        _ValidationLogFilter.active.on = False
+
+
 def caldav_load_error(data: bytes) -> str | None:
     """Run Radicale's own loader; items it rejects are invisible to CalDAV clients."""
     from radicale import item as radicale_item
 
     try:
         vobject_items = radicale_item.read_components(data.decode("utf-8"))
-        radicale_item.check_and_sanitize_items(
-            vobject_items,
-            max_vevent_rrule_occurrence=RADICALE_MAX_RRULE_OCCURRENCES,
-            tag="VCALENDAR",
-        )
+        with quiet_radicale_logger():
+            radicale_item.check_and_sanitize_items(
+                vobject_items,
+                max_vevent_rrule_occurrence=RADICALE_MAX_RRULE_OCCURRENCES,
+                tag="VCALENDAR",
+            )
         (vobject_item,) = vobject_items
         item = radicale_item.Item(collection_path="validate", vobject_item=vobject_item)
         item.etag, item.uid, item.time_range  # noqa: B018 - force Radicale to compute these
@@ -1223,6 +1309,7 @@ class StoredItem:
     size: int
     mtime_ns: int
     inode: int
+    ctime_ns: int
     calendar: Calendar | None
     uid: str | None
     component: str | None
@@ -1232,8 +1319,18 @@ class StoredItem:
     def last_modified(self) -> datetime:
         return datetime.fromtimestamp(self.mtime_ns / 1_000_000_000, tz=timezone.utc)
 
+    @property
+    def stamp(self) -> tuple[int, int, int, int]:
+        return (self.mtime_ns, self.size, self.inode, self.ctime_ns)
+
+
+def file_stamp(stat: os.stat_result) -> tuple[int, int, int, int]:
+    # ctime catches in-place edits that keep size and mtime; it cannot be set from user space.
+    return (stat.st_mtime_ns, stat.st_size, stat.st_ino, stat.st_ctime_ns)
+
 
 _stored_item_cache: dict[str, StoredItem] = {}
+MAX_CACHED_ITEMS = 50_000
 _stored_item_cache_lock = threading.Lock()
 
 
@@ -1271,7 +1368,7 @@ def read_stored_item(path: Path) -> StoredItem | None:
             stat = os.fstat(handle.fileno())
             with _stored_item_cache_lock:
                 cached = _stored_item_cache.get(key)
-            if cached and (cached.mtime_ns, cached.size, cached.inode) == (stat.st_mtime_ns, stat.st_size, stat.st_ino):
+            if cached and cached.stamp == file_stamp(stat):
                 return cached
             data = handle.read()
     except (FileNotFoundError, IsADirectoryError):
@@ -1299,12 +1396,15 @@ def read_stored_item(path: Path) -> StoredItem | None:
         size=stat.st_size,
         mtime_ns=stat.st_mtime_ns,
         inode=stat.st_ino,
+        ctime_ns=stat.st_ctime_ns,
         calendar=calendar,
         uid=uid,
         component=component,
         error=error,
     )
     with _stored_item_cache_lock:
+        if len(_stored_item_cache) >= MAX_CACHED_ITEMS:
+            _stored_item_cache.clear()
         _stored_item_cache[key] = item
     return item
 
@@ -1371,6 +1471,8 @@ def check_write_preconditions(current_etag: str | None, if_match: str | None, if
             raise precondition_failed("If-Match failed: the event does not exist", None)
         # Strong comparison: weak tags never match for writes.
         if tags is not None and current_etag not in tags:
+            if all(tag.startswith("W/") for tag in tags):
+                raise precondition_failed("If-Match failed: weak ETags (W/...) never match for writes; send the strong ETag", current_etag)
             raise precondition_failed(f"If-Match failed: the event has changed (current ETag {current_etag})", current_etag)
     if if_none_match is not None:
         tags = parse_entity_tags(if_none_match)
@@ -1384,7 +1486,10 @@ def check_write_preconditions(current_etag: str | None, if_match: str | None, if
 def if_none_match_hits(header: str | None, current_etag: str) -> bool:
     if header is None:
         return False
-    tags = parse_entity_tags(header)
+    try:
+        tags = parse_entity_tags(header)
+    except HTTPException:
+        return False  # unquoted or garbage header: serve the full response
     return tags is None or current_etag in {tag.removeprefix("W/") for tag in tags}
 
 
@@ -1415,6 +1520,7 @@ def commit_writes(writes: list[PlannedWrite], source: str) -> None:
             needs_calendar = any(w.data is not None for w in writes if (w.owner, w.calendar) == (owner, calendar))
             if needs_calendar and ensure_calendar(owner, calendar):
                 created_calendars.append(collection_path(owner, calendar))
+                journal_mark_known(owner, calendar)
         for write in writes:
             previous = write.path.read_bytes() if write.path.exists() else None
             snapshots.append((write.path, previous))
@@ -1438,14 +1544,22 @@ def commit_writes(writes: list[PlannedWrite], source: str) -> None:
             except Exception:  # pragma: no cover - best effort
                 pass
         raise
-    for write in writes:
+    for owner, calendar, uid in sorted({(write.owner, write.calendar, write.uid) for write in writes}):
         try:
-            if write.data is None:
-                delete_managed_attachments(write.owner, write.calendar, write.uid)
-            else:
-                allowed = attachment_uris_from_ics(write.data)
-                if allowed is not None:
-                    reconcile_managed_attachments(write.owner, write.calendar, write.uid, allowed)
+            # Several files can carry the same UID (e.g. copies made by clients); an
+            # attachment stays as long as any of them still references it.
+            allowed: set[str] | None = set()
+            for path in iter_collection_files(owner, calendar):
+                item = read_stored_item(path)
+                if item is None or item.uid != uid:
+                    continue
+                uris = attachment_uris_from_ics(path.read_bytes())
+                if uris is None:
+                    allowed = None  # unparseable copy: keep everything rather than guess
+                    break
+                allowed |= uris
+            if allowed is not None:
+                reconcile_managed_attachments(owner, calendar, uid, allowed)
         except Exception as exc:  # pragma: no cover - attachments must not undo an applied write
             print(f"[attachments] reconcile failed: {exc.__class__.__name__}", flush=True)
     journal_sync(scopes, source)
@@ -1642,6 +1756,8 @@ def is_recurring_calendar(calendar: Calendar) -> bool:
 
 
 def has_unbounded_rrule(calendar: Calendar) -> bool:
+    if degenerate_rrule_errors(calendar):
+        return True
     for event in calendar.walk("VEVENT"):
         rules = event.get("RRULE")
         if rules is None:
@@ -1671,6 +1787,9 @@ def iter_occurrences(
     cheaper per instance than after(); after() is only used to find the first
     instance of an open-ended range.
     """
+    problems = degenerate_rrule_errors(calendar)
+    if problems:
+        raise ValueError(problems[0])  # would never terminate; callers report the item as invalid
     query = recurring_ical_events.of(calendar)
     scan_from = (range_from or EARLIEST_SCAN_START) - RECURRENCE_SCAN_MARGIN
     first = earliest_start(calendar, tz)
@@ -1826,6 +1945,7 @@ class ChangeJournal:
         mtime_ns INTEGER NOT NULL,
         size INTEGER NOT NULL,
         inode INTEGER NOT NULL,
+        ctime_ns INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (owner, calendar, href)
     );
     CREATE TABLE IF NOT EXISTS known_calendars (
@@ -1845,6 +1965,9 @@ class ChangeJournal:
         conn.row_factory = sqlite3.Row
         try:
             conn.executescript(self.SCHEMA)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(state)")}
+            if "ctime_ns" not in columns:
+                conn.execute("ALTER TABLE state ADD COLUMN ctime_ns INTEGER NOT NULL DEFAULT 0")
             conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('journal_id', ?)", (secrets.token_hex(8),))
             conn.commit()
             yield conn
@@ -1917,11 +2040,7 @@ class ChangeJournal:
             except FileNotFoundError:
                 continue
             row = known.get(href)
-            if row is not None and (row["mtime_ns"], row["size"], row["inode"]) == (
-                stat.st_mtime_ns,
-                stat.st_size,
-                stat.st_ino,
-            ):
+            if row is not None and (row["mtime_ns"], row["size"], row["inode"], row["ctime_ns"]) == file_stamp(stat):
                 seen.add(href)
                 continue
             item = read_stored_item(path)
@@ -1935,8 +2054,9 @@ class ChangeJournal:
             else:
                 change_type = None
             conn.execute(
-                "INSERT OR REPLACE INTO state(owner, calendar, href, uid, etag, mtime_ns, size, inode) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (owner, calendar, href, item.uid, item.etag, item.mtime_ns, item.size, item.inode),
+                "INSERT OR REPLACE INTO state(owner, calendar, href, uid, etag, mtime_ns, size, inode, ctime_ns)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (owner, calendar, href, item.uid, item.etag, item.mtime_ns, item.size, item.inode, item.ctime_ns),
             )
             if change_type:
                 modified_at = item.last_modified.isoformat() if label in {"external", "baseline"} else now
@@ -1979,11 +2099,29 @@ class ChangeJournal:
 journal = ChangeJournal(JOURNAL_FILE)
 
 
+def journal_mark_known(owner: str, calendar: str) -> None:
+    """Register a calendar created by an API write, so its first events are not labelled baseline."""
+    try:
+        with journal.connect() as conn:
+            with conn:
+                conn.execute("INSERT OR IGNORE INTO known_calendars(owner, calendar) VALUES (?, ?)", (owner, calendar))
+    except Exception as exc:  # pragma: no cover
+        record_journal_failure(exc)
+
+
 def journal_sync(scopes: Iterable[tuple[str, str]] | None, source: str) -> None:
     try:
         journal.sync(scopes, source)
     except Exception as exc:  # pragma: no cover - the journal must never block a write
-        print(f"[journal] sync failed: {exc.__class__.__name__}: {exc}", flush=True)
+        record_journal_failure(exc)
+
+
+journal_failures: dict[str, Any] = {"count": 0, "last_at": None, "last_error": None}
+
+
+def record_journal_failure(exc: Exception) -> None:
+    journal_failures.update(count=journal_failures["count"] + 1, last_at=utc_now_iso(), last_error=exc.__class__.__name__)
+    print(f"[journal] sync failed: {exc.__class__.__name__}", flush=True)
 
 
 def encode_token(payload: dict[str, Any]) -> str:
@@ -2404,32 +2542,51 @@ async def store_uploaded_attachment(
     now = datetime.now(timezone.utc).isoformat()
     content_type = safe_content_type(upload.content_type)
     try:
-        with storage_lock():
-            found = read_event(owner, calendar_name, uid)
-            if found is None:
-                raise ApiError(404, "event_not_found", "Event not found")
-            updated = add_attachment_to_ics(found[1], public_uri, content_type, original_name)
-            commit_writes([PlannedWrite(owner, calendar_name, uid, found[0], updated)], "attachment")
-            event_end = event_end_from_ics(updated)
-            records = load_attachment_index()
-            record = {
-                "id": attachment_id,
-                "owner": owner,
-                "calendar": calendar_name,
-                "uid": uid,
-                "filename": original_name,
-                "content_type": content_type,
-                "relative_path": relative_path.as_posix(),
-                "uri": public_uri,
-                "created_at": now,
-                "event_end": event_end.isoformat() if event_end else None,
-            }
-            records.append(record)
-            save_attachment_index(records)
+        record, etag = await run_in_threadpool(
+            reference_uploaded_attachment,
+            owner, calendar_name, uid, attachment_id, original_name, content_type, relative_path, public_uri, now,
+        )
     except BaseException:
         delete_file_quietly(target)
         delete_empty_parents(target)
         raise
+    return record, etag
+
+
+def reference_uploaded_attachment(
+    owner: str,
+    calendar_name: str,
+    uid: str,
+    attachment_id: str,
+    original_name: str,
+    content_type: str,
+    relative_path: Path,
+    public_uri: str,
+    now: str,
+) -> tuple[dict[str, Any], str]:
+    """Add the ATTACH property and index record for a stored upload (blocking; holds the storage lock)."""
+    with storage_lock():
+        found = read_event(owner, calendar_name, uid)
+        if found is None:
+            raise ApiError(404, "event_not_found", "Event not found")
+        updated = add_attachment_to_ics(found[1], public_uri, content_type, original_name)
+        commit_writes([PlannedWrite(owner, calendar_name, uid, found[0], updated)], "attachment")
+        event_end = event_end_from_ics(updated)
+        records = load_attachment_index()
+        record = {
+            "id": attachment_id,
+            "owner": owner,
+            "calendar": calendar_name,
+            "uid": uid,
+            "filename": original_name,
+            "content_type": content_type,
+            "relative_path": relative_path.as_posix(),
+            "uri": public_uri,
+            "created_at": now,
+            "event_end": event_end.isoformat() if event_end else None,
+        }
+        records.append(record)
+        save_attachment_index(records)
     return record, compute_etag(updated)
 
 
@@ -2594,6 +2751,31 @@ CONTENT_LINE_RE = re.compile(
 )
 
 
+VALIDATION_MAX_INSTANCES = 200_000
+
+
+def series_instances_among(rule_set: Any, candidates: list[Any]) -> tuple[set[Any], bool]:
+    """Which candidates are instances of the series, in one bounded pass.
+
+    Returns (matched, complete); complete is False when the pass stopped at
+    VALIDATION_MAX_INSTANCES before reaching the latest candidate.
+    """
+    remaining = set(candidates)
+    matched: set[Any] = set()
+    if not remaining:
+        return matched, True
+    latest = max(remaining)
+    for count, occurrence in enumerate(rule_set):
+        if count >= VALIDATION_MAX_INSTANCES:
+            return matched, False
+        if occurrence in remaining:
+            matched.add(occurrence)
+            remaining.discard(occurrence)
+        if not remaining or occurrence > latest:
+            break
+    return matched, True
+
+
 def unfold_content_lines(raw_lines: list[str]) -> list[tuple[int, str]]:
     logical: list[tuple[int, str]] = []
     for number, line in enumerate(raw_lines, start=1):
@@ -2689,6 +2871,9 @@ def validate_ics(data: bytes, expected_uid: str | None = None) -> dict[str, Any]
         return result()
     for problem in property_parse_errors(calendar):
         error("invalid_property", problem)
+    degenerate = degenerate_rrule_errors(calendar)
+    for problem in degenerate:
+        error("invalid_rrule", problem)
     if "VERSION" not in calendar:
         warning("missing_version", "VCALENDAR has no VERSION")
     if "PRODID" not in calendar:
@@ -2760,6 +2945,8 @@ def validate_ics(data: bytes, expected_uid: str | None = None) -> dict[str, Any]
             for until in rule.get("UNTIL", []):
                 if isinstance(until, datetime) != isinstance(dtstart, datetime):
                     error("invalid_rrule", f"{label} RRULE UNTIL must have the same value type (DATE or DATE-TIME) as DTSTART")
+            if degenerate:
+                continue  # already reported; expanding it would never terminate
             try:
                 rule_set = dateutil_rrule.rrulestr(raw_rule, dtstart=as_naive_or_aware(dtstart, dtstart), forceset=True)
                 if next(iter(rule_set), None) is None:
@@ -2783,7 +2970,7 @@ def validate_ics(data: bytes, expected_uid: str | None = None) -> dict[str, Any]
         ]
         if exdates and not rules and not rdates:
             warning("exdate_without_recurrence", f"{label} has EXDATE but no RRULE or RDATE")
-        frequent = any(str(rule.get("FREQ", [""])[0]).upper() in {"SECONDLY", "MINUTELY"} for rule in rules)
+        candidates: dict[Any, Any] = {}
         for value in exdates:
             if not isinstance(value, date):
                 continue
@@ -2794,36 +2981,38 @@ def validate_ics(data: bytes, expected_uid: str | None = None) -> dict[str, Any]
                     f"but DTSTART is a {'DATE-TIME' if isinstance(dtstart, datetime) else 'DATE'}",
                 )
                 continue
-            if rule_set is None or frequent:
-                continue
             candidate = as_naive_or_aware(value, dtstart)
-            try:
-                if (isinstance(candidate, datetime) and isinstance(dtstart, datetime)
-                        and (candidate.tzinfo is None) != (dtstart.tzinfo is None)):
-                    raise TypeError("floating/zoned mismatch")
-                matched = candidate in rdates or bool(
-                    rule_set.between(candidate - timedelta(seconds=1), candidate + timedelta(seconds=1), inc=True)
-                )
-            except TypeError:
-                matched = False
-            if not matched:
-                error(
-                    "exdate_not_in_recurrence",
-                    f"{label} EXDATE {ical_value_iso(value)} does not match any occurrence; check its time and TZID against DTSTART",
-                )
+            if isinstance(candidate, datetime) and isinstance(dtstart, datetime) and (candidate.tzinfo is None) != (dtstart.tzinfo is None):
+                error("exdate_not_in_recurrence", f"{label} EXDATE {ical_value_iso(value)} mixes floating and zoned time with DTSTART")
+                continue
+            if candidate not in rdates:
+                candidates[candidate] = value
+        if rule_set is not None and candidates:
+            matched, complete = series_instances_among(rule_set, list(candidates))
+            for candidate, value in candidates.items():
+                if candidate in matched:
+                    continue
+                if complete:
+                    error(
+                        "exdate_not_in_recurrence",
+                        f"{label} EXDATE {ical_value_iso(value)} does not match any occurrence; check its time and TZID against DTSTART",
+                    )
+                else:
+                    warning("exdate_not_checked", f"{label} EXDATE {ical_value_iso(value)} is too far into the series to check")
 
-    if master_rule is not None:
-        master_start = decoded_or_none(masters[0], "DTSTART") if masters else None
+    if master_rule is not None and masters:
+        master_start = decoded_or_none(masters[0], "DTSTART")
+        overrides = {}
         for event in events:
             rid = decoded_or_none(event, "RECURRENCE-ID")
-            if rid is None or not isinstance(master_start, date):
-                continue
-            candidate = as_naive_or_aware(rid, master_start)
-            try:
-                matched = bool(master_rule.between(candidate - timedelta(seconds=1), candidate + timedelta(seconds=1), inc=True))
-            except TypeError:
-                matched = True
-            if not matched:
+            if isinstance(rid, date) and isinstance(master_start, date):
+                candidate = as_naive_or_aware(rid, master_start)
+                if not (isinstance(candidate, datetime) and isinstance(master_start, datetime)
+                        and (candidate.tzinfo is None) != (master_start.tzinfo is None)):
+                    overrides[candidate] = rid
+        matched, complete = series_instances_among(master_rule, list(overrides))
+        for candidate, rid in overrides.items():
+            if complete and candidate not in matched:
                 warning("recurrence_id_not_in_series", f"RECURRENCE-ID {ical_value_iso(rid)} does not match an occurrence of the series")
 
     if not errors:
@@ -2972,6 +3161,19 @@ def split_calendar_bundle(data: bytes) -> tuple[list[tuple[str, bytes]], list[di
         if not uid:
             raise HTTPException(status_code=400, detail="Every VEVENT in the bundle must have a UID")
         groups.setdefault(uid, []).append(sub)
+    duplicated = sorted(
+        uid for uid, components in groups.items()
+        if sum(1 for component in components if component.get("RECURRENCE-ID") is None) > 1
+    )
+    if duplicated:
+        raise ApiError(
+            400,
+            "duplicate_uids",
+            f"{len(duplicated)} UID(s) appear as more than one event in the bundle",
+            hint="A calendar can hold each UID once. Remove the extra copies, or restore a zip backup "
+                 "(POST /api/restore), which keeps every file byte-for-byte.",
+            details={"uids": duplicated[:50]},
+        )
     resources: list[tuple[str, bytes]] = []
     for uid, components in groups.items():
         resource = Calendar()
@@ -3026,68 +3228,238 @@ def build_export_calendar(owner: str, calendar_name: str) -> tuple[bytes, int, l
     return bundle.to_ical(), len(uids), skipped
 
 
-def build_export_zip(owner: str | None, calendar_name: str | None, include_attachments: bool) -> tuple[Path, int]:
-    """Write a byte-exact backup archive to a temporary file. Returns (path, calendar count)."""
-    calendars = [
-        item
-        for item in list_calendars()
-        if (owner is None or item["owner"] == owner) and (calendar_name is None or item["calendar"] == calendar_name)
-    ]
-    fd, tmp_name = tempfile.mkstemp(prefix="pocket-caldav-export-", suffix=".zip")
+EXPORT_FORMAT = "pocket-caldav-export"
+EXPORT_TEMP_MAX_AGE_SECONDS = 3600
+
+
+def export_temp_file(prefix: str) -> Path:
+    """Temporary archive under DATA_DIR/exports; leftovers from interrupted downloads are swept."""
+    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff = datetime.now(timezone.utc).timestamp() - EXPORT_TEMP_MAX_AGE_SECONDS
+    for stale in EXPORTS_DIR.glob("*.zip"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except FileNotFoundError:
+            pass
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=".zip", dir=EXPORTS_DIR)
     os.close(fd)
+    return Path(name)
+
+
+def build_export_zip(owner: str | None, calendar_name: str | None, include_attachments: bool) -> tuple[Path, int]:
+    """Write a byte-exact backup archive to a temporary file. Returns (path, calendar count).
+
+    Event files, props and the attachment index are snapshotted under the storage
+    lock; attachment files are immutable once stored, so they are read afterwards
+    without blocking CalDAV clients.
+    """
+    with storage_lock():
+        calendars = [
+            item
+            for item in list_calendars()
+            if (owner is None or item["owner"] == owner) and (calendar_name is None or item["calendar"] == calendar_name)
+        ]
+        snapshot = []
+        for info in calendars:
+            directory = collection_path(info["owner"], info["calendar"])
+            props_file = directory / ".Radicale.props"
+            props = props_file.read_bytes() if props_file.is_file() else None
+            events = []
+            for path in iter_collection_files(info["owner"], info["calendar"]):
+                item = read_stored_item(path)
+                events.append((path.name, item.uid if item else None, path.read_bytes()))
+            bundle, _count, _skipped = build_export_calendar(info["owner"], info["calendar"])
+            snapshot.append((info, props, events, bundle))
+        selected = {(info["owner"], info["calendar"]) for info in calendars}
+        records = [record for record in load_attachment_index() if (record.get("owner"), record.get("calendar")) in selected]
+    archive_path = export_temp_file("export-")
     manifest: dict[str, Any] = {
-        "format": "pocket-caldav-export",
+        "format": EXPORT_FORMAT,
         "version": 1,
         "created_at": utc_now_iso(),
         "calendars": [],
         "attachments": [],
     }
     try:
-        with zipfile.ZipFile(tmp_name, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for info in calendars:
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for info, props, events, bundle in snapshot:
                 base = f"calendars/{info['owner']}/{info['calendar']}"
-                directory = collection_path(info["owner"], info["calendar"])
-                props_file = directory / ".Radicale.props"
-                if props_file.is_file():
-                    archive.write(props_file, f"{base}/props.json")
-                events = []
-                for path in iter_collection_files(info["owner"], info["calendar"]):
-                    data = path.read_bytes()
-                    item = read_stored_item(path)
-                    archive.writestr(f"{base}/events/{path.name}", data)
-                    events.append(
-                        {
-                            "href": path.name,
-                            "uid": item.uid if item else None,
-                            "etag": compute_etag(data),
-                            "sha256": hashlib.sha256(data).hexdigest(),
-                            "size": len(data),
-                        }
+                if props is not None:
+                    archive.writestr(f"{base}/props.json", props)
+                entries = []
+                for href, uid, data in events:
+                    archive.writestr(f"{base}/events/{href}", data)
+                    entries.append(
+                        {"href": href, "uid": uid, "etag": compute_etag(data), "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
                     )
-                bundle, _count, _skipped = build_export_calendar(info["owner"], info["calendar"])
                 archive.writestr(f"{base}/calendar.ics", bundle)
-                manifest["calendars"].append({**info, "events": events})
-            selected = {(info["owner"], info["calendar"]) for info in calendars}
-            for record in load_attachment_index():
-                if (record.get("owner"), record.get("calendar")) not in selected:
-                    continue
+                manifest["calendars"].append({**info, "events": entries})
+            for record in records:
                 path = attachment_file(record)
-                entry = {key: record.get(key) for key in ("id", "owner", "calendar", "uid", "filename", "content_type", "uri", "created_at")}
+                entry = {
+                    key: record.get(key)
+                    for key in ("id", "owner", "calendar", "uid", "filename", "content_type", "uri", "created_at", "relative_path")
+                }
                 entry["included"] = False
-                if include_attachments and path and path.is_file():
-                    archive_name = f"attachments/{record.get('relative_path')}"
-                    digest = hashlib.sha256()
-                    with path.open("rb") as handle:
-                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                    archive.write(path, archive_name)
-                    entry.update(included=True, path=archive_name, sha256=digest.hexdigest(), size=path.stat().st_size)
+                if include_attachments and path is not None:
+                    try:
+                        data = path.read_bytes()
+                    except FileNotFoundError:
+                        data = None  # deleted since the snapshot
+                    if data is not None:
+                        archive_name = f"attachments/{record.get('relative_path')}"
+                        archive.writestr(archive_name, data)
+                        entry.update(included=True, path=archive_name, sha256=hashlib.sha256(data).hexdigest(), size=len(data))
                 manifest["attachments"].append(entry)
             archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
     except BaseException:
-        delete_file_quietly(Path(tmp_name))
+        delete_file_quietly(archive_path)
         raise
-    return Path(tmp_name), len(calendars)
+    return archive_path, len(calendars)
+
+
+def restore_error(message: str, **details: Any) -> ApiError:
+    return ApiError(400, "invalid_backup", message, hint="Use an archive produced by GET /api/export?format=zip.", details=details or None)
+
+
+def safe_archive_member(archive: zipfile.ZipFile, name: str, expected_sha256: str | None, expected_size: int | None, limit: int) -> bytes:
+    try:
+        info = archive.getinfo(name)
+    except KeyError as exc:
+        raise restore_error(f"Archive is missing {name}", member=name) from exc
+    if info.file_size > limit or (expected_size is not None and info.file_size != expected_size):
+        raise restore_error(f"{name} has an unexpected size", member=name)
+    data = archive.read(info)
+    if expected_sha256 is not None and hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise restore_error(f"{name} does not match its SHA-256 in manifest.json; the archive is corrupt", member=name)
+    return data
+
+
+def restore_backup(
+    archive_path: Path,
+    *,
+    owner: str | None,
+    calendar_name: str | None,
+    replace: bool,
+    dry_run: bool,
+    max_member_bytes: int,
+) -> dict[str, Any]:
+    """Restore calendars (byte-exact) and attachments from a zip made by build_export_zip.
+
+    Every file is verified against the manifest before anything is written. A
+    calendar that already has events is only touched with replace=True, which
+    makes it identical to the backup.
+    """
+    try:
+        archive = zipfile.ZipFile(archive_path)
+    except zipfile.BadZipFile as exc:
+        raise restore_error("Body is not a zip archive") from exc
+    with archive:
+        try:
+            manifest = json.loads(safe_archive_member(archive, "manifest.json", None, None, max_member_bytes))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise restore_error("manifest.json is not valid JSON") from exc
+        if not isinstance(manifest, dict) or manifest.get("format") != EXPORT_FORMAT or manifest.get("version") != 1:
+            raise restore_error("manifest.json is not a Pocket CalDAV export (format/version)")
+        plans = []
+        for entry in manifest.get("calendars", []):
+            cal_owner, cal_name = str(entry.get("owner", "")), str(entry.get("calendar", ""))
+            if (owner and cal_owner != owner) or (calendar_name and cal_name != calendar_name):
+                continue
+            if not SEGMENT_RE.fullmatch(cal_owner) or not SEGMENT_RE.fullmatch(cal_name):
+                raise restore_error(f"Invalid calendar name {cal_owner!r}/{cal_name!r}")
+            base = f"calendars/{cal_owner}/{cal_name}"
+            props = None
+            if f"{base}/props.json" in archive.namelist():
+                props = safe_archive_member(archive, f"{base}/props.json", None, None, max_member_bytes)
+                try:
+                    if not isinstance(json.loads(props), dict):
+                        raise ValueError
+                except ValueError as exc:
+                    raise restore_error(f"{base}/props.json is not a JSON object") from exc
+            events = []
+            for event in entry.get("events", []):
+                href = str(event.get("href", ""))
+                if not is_item_filename(href):
+                    raise restore_error(f"Invalid event file name {href!r}")
+                data = safe_archive_member(archive, f"{base}/events/{href}", event.get("sha256"), event.get("size"), max_member_bytes)
+                events.append((href, str(event.get("uid") or Path(href).stem), data))
+            plans.append((cal_owner, cal_name, props, events))
+        if (owner or calendar_name) and not plans:
+            raise ApiError(404, "calendar_not_in_backup", "The archive does not contain the requested calendar")
+        attachment_plans = []
+        selected = {(plan[0], plan[1]) for plan in plans}
+        skipped_attachments = 0
+        for entry in manifest.get("attachments", []):
+            if (entry.get("owner"), entry.get("calendar")) not in selected:
+                continue
+            if not entry.get("included"):
+                skipped_attachments += 1
+                continue
+            relative = Path(str(entry.get("relative_path") or ""))
+            if len(relative.parts) != 4 or not all(SEGMENT_RE.fullmatch(part) or is_item_filename(part) for part in relative.parts) \
+                    or ".." in relative.parts or relative.is_absolute() or not entry.get("id"):
+                raise restore_error(f"Invalid attachment path {relative.as_posix()!r}")
+            data = safe_archive_member(archive, f"attachments/{relative.as_posix()}", entry.get("sha256"), entry.get("size"), max_member_bytes)
+            attachment_plans.append((entry, relative, data))
+
+    result: dict[str, Any] = {"dry_run": dry_run, "replace": replace, "calendars": [], "attachments_restored": 0,
+                              "attachments_not_in_archive": skipped_attachments}
+    with storage_lock():
+        for cal_owner, cal_name, _props, events in plans:
+            existing = {path.name: path for path in iter_collection_files(cal_owner, cal_name)}
+            if existing and not replace:
+                raise ApiError(409, "calendar_not_empty", f"{cal_owner}/{cal_name} already has {len(existing)} event(s)",
+                               hint="Restore into an empty or deleted calendar, or pass replace=true to make it identical to the backup.",
+                               details={"owner": cal_owner, "calendar": cal_name, "event_count": len(existing)})
+            backup_hrefs = {href for href, _uid, _data in events}
+            result["calendars"].append({
+                "owner": cal_owner,
+                "calendar": cal_name,
+                "events_written": sum(1 for href, _uid, data in events if href not in existing or existing[href].read_bytes() != data),
+                "events_deleted": len(set(existing) - backup_hrefs),
+                "events_in_backup": len(events),
+            })
+        if dry_run:
+            result["attachments_restored"] = len(attachment_plans)
+            return result
+        index = load_attachment_index()
+        known_ids = {record.get("id") for record in index}
+        for entry, relative, data in attachment_plans:
+            target = (ATTACHMENTS_DIR / relative).resolve()
+            if not target.is_relative_to(ATTACHMENTS_DIR.resolve()):
+                raise restore_error(f"Invalid attachment path {relative.as_posix()!r}")
+            if not target.exists():
+                atomic_write_bytes(target, data)
+            if entry["id"] not in known_ids:
+                index.append({
+                    "id": entry["id"], "owner": entry.get("owner"), "calendar": entry.get("calendar"), "uid": entry.get("uid"),
+                    "filename": entry.get("filename"), "content_type": entry.get("content_type"),
+                    "relative_path": relative.as_posix(), "uri": entry.get("uri"), "created_at": entry.get("created_at") or utc_now_iso(),
+                    "event_end": None,
+                })
+                known_ids.add(entry["id"])
+            result["attachments_restored"] += 1
+        save_attachment_index(index)
+        for cal_owner, cal_name, props, events in plans:
+            existing = {path.name: path for path in iter_collection_files(cal_owner, cal_name)}
+            writes = [
+                PlannedWrite(cal_owner, cal_name, uid, collection_path(cal_owner, cal_name) / href, data)
+                for href, uid, data in events
+            ]
+            uids_by_href = {path.name: (read_stored_item(path).uid if read_stored_item(path) else None) for path in existing.values()}
+            writes += [
+                PlannedWrite(cal_owner, cal_name, uids_by_href.get(href) or Path(href).stem, path, None)
+                for href, path in existing.items()
+                if href not in {href for href, _uid, _data in events}
+            ]
+            ensure_calendar(cal_owner, cal_name)
+            journal_mark_known(cal_owner, cal_name)
+            commit_writes(writes, "restore")
+            if props is not None:
+                atomic_write_bytes(collection_path(cal_owner, cal_name) / ".Radicale.props", props)
+    return result
 
 
 def delete_calendar(owner: str, calendar: str, force: bool) -> dict[str, Any]:
@@ -3557,12 +3929,6 @@ def apply_event_fields(calendar: Calendar, event: Any, fields: dict[str, Any], *
         set_property(event, "SEQUENCE", int(event.get("SEQUENCE", 0) or 0) + 1)
 
 
-def listify(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    return value if isinstance(value, list) else [value]
-
-
 MAPPED_EVENT_PROPERTIES = {
     "UID", "DTSTAMP", "DTSTART", "DTEND", "DURATION", "SUMMARY", "LOCATION", "DESCRIPTION", "URL", "STATUS",
     "TRANSP", "CATEGORIES", "RRULE", "EXDATE", "RDATE", "ATTACH", "SEQUENCE", "CREATED", "LAST-MODIFIED",
@@ -3793,6 +4159,7 @@ Delete (verifiable):       DELETE /api/calendars/{owner}/{calendar}/{uid} (If-Ma
 Several changes at once:   POST /api/batch {"operations": [...]}  (all or nothing)
 What changed since last run: GET /api/changes?since=<next_token>
 Back up before destructive work: GET /api/export?format=zip (manifest.json has SHA-256 per file)
+Restore that backup:       POST /api/restore (body: the zip; dry_run=true first; replace=true to overwrite)
 Attach a file:             POST .../{uid}/attachments (multipart field `file`), verify with GET .../{uid}/attachments
 Raw iCalendar:             GET/PUT .../{uid} with text/calendar; POST /api/validate checks ICS before writing.
 """
@@ -3829,7 +4196,9 @@ def query_events(
     if cursor:
         payload = decode_token(cursor, "cursor")
         key = payload.get("k")
-        if payload.get("f") != fingerprint or not isinstance(key, list) or len(key) != 6:
+        key_types = (int, str, int, str, str, str)
+        if (payload.get("f") != fingerprint or not isinstance(key, list) or len(key) != len(key_types)
+                or not all(type(part) is kind for part, kind in zip(key, key_types))):
             raise ApiError(400, "cursor_mismatch", "cursor does not belong to this query",
                            hint="Repeat the exact query parameters of the request that returned the cursor.")
         after_key = tuple(key)
@@ -3858,7 +4227,7 @@ def route_tag(path: str) -> str:
         return "attachments"
     if path.startswith(("/api/changes",)) or path.endswith("/history"):
         return "sync"
-    if path.startswith("/api/export") or path.endswith("/import"):
+    if path.startswith(("/api/export", "/api/restore")) or path.endswith("/import"):
         return "backup"
     if path in {"/api/calendars", "/api/calendars/{owner}/{calendar_name}"}:
         return "calendars"
@@ -4327,8 +4696,10 @@ def create_app() -> FastAPI:
 
         Without from/to every event is returned. Recurring series match when any
         instance overlaps. Results are ordered by (start, uid, recurrence-id) and
-        paged with an opaque keyset cursor, so a full sweep returns every
-        matching item exactly once even if the calendar changes in between.
+        paged with an opaque keyset cursor: on an unchanged calendar a full sweep
+        returns every matching item exactly once. An event edited mid-sweep can
+        move across the cursor (seen twice or not at all); use /api/changes to
+        catch up on edits.
         """
         owner, calendar_name = require_calendar(owner, calendar_name)
         return query_events(
@@ -4374,7 +4745,7 @@ def create_app() -> FastAPI:
         "/api/calendars/{owner}/{calendar_name}/import",
         dependencies=[Depends(require_api_key)],
         response_model=BatchResponse,
-        responses=error_responses(400, 412, 413),
+        responses=batch_error_responses(400, 412, 413),
         openapi_extra=ICS_REQUEST_BODY,
         summary="Import a multi-event VCALENDAR",
     )
@@ -4686,7 +5057,7 @@ def create_app() -> FastAPI:
         "/api/batch",
         dependencies=[Depends(require_api_key)],
         response_model=BatchResponse,
-        responses=error_responses(400, 404, 409, 412, 413),
+        responses=batch_error_responses(400, 404, 409, 412, 413),
         summary="Apply several puts and deletes atomically",
     )
     async def api_batch(payload: BatchRequest) -> JSONResponse:
@@ -4757,7 +5128,13 @@ def create_app() -> FastAPI:
         next_token = encode_change_token(journal_id, next_seq)
         if has_more:
             response.headers.update(next_link(request, "since", next_token))
-        return {"changes": [change_entry(row) for row in rows], "next_token": next_token, "truncated": has_more}
+        warnings = []
+        if journal_failures["count"]:
+            warnings.append(
+                f"The change journal failed {journal_failures['count']} time(s), last at {journal_failures['last_at']} "
+                f"({journal_failures['last_error']}); those writes are recorded later with source `external`."
+            )
+        return {"changes": [change_entry(row) for row in rows], "next_token": next_token, "truncated": has_more, "warnings": warnings}
 
     @app.get(
         "/api/export",
@@ -4770,6 +5147,7 @@ def create_app() -> FastAPI:
             **error_responses(400, 404),
         },
         summary="Export or back up calendars",
+        response_class=Response,
     )
     def api_export_calendars(
         owner: str | None = Query(None),
@@ -4804,8 +5182,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="calendar requires owner")
         if owner is not None and calendar is not None:
             require_calendar(owner, calendar)
-        with storage_lock():
-            archive, count = build_export_zip(owner, calendar, include_attachments)
+        archive, count = build_export_zip(owner, calendar, include_attachments)
         name = "-".join(part for part in ("pocket-caldav", owner, calendar) if part)
         return FileResponse(
             archive,
@@ -4814,6 +5191,51 @@ def create_app() -> FastAPI:
             headers={"X-Calendar-Count": str(count), "Cache-Control": "private, no-store"},
             background=BackgroundTask(delete_file_quietly, archive),
         )
+
+    @app.post(
+        "/api/restore",
+        dependencies=[Depends(require_api_key)],
+        responses=error_responses(400, 404, 409, 413),
+        openapi_extra={"requestBody": {"required": True, "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}}}},
+        summary="Restore a zip backup",
+    )
+    async def api_restore_backup(
+        request: Request,
+        owner: str | None = Query(None, description="Only restore this owner's calendars."),
+        calendar: str | None = Query(None, description="Only restore this calendar (requires owner)."),
+        replace: bool = Query(False, description="Overwrite calendars that already have events, making them identical to the backup."),
+        dry_run: bool = Query(False, description="Verify the archive and report what would change."),
+    ) -> dict[str, Any]:
+        """Body: the archive from GET /api/export?format=zip. Every file is checked against the
+        SHA-256 in manifest.json before anything is written. Event files are restored
+        byte-for-byte (duplicate UIDs included), together with calendar properties and the
+        attachments the archive contains. Calendars that already have events are refused
+        (409) unless replace=true.
+        """
+        if owner is not None:
+            owner = validate_segment(owner, "owner")
+        if calendar is not None:
+            calendar = validate_segment(calendar, "calendar")
+            if owner is None:
+                raise ApiError(400, "missing_owner", "calendar requires owner")
+        upload = export_temp_file("restore-")
+        try:
+            with upload.open("wb") as handle:
+                async for chunk in request.stream():
+                    handle.write(chunk)
+            if upload.stat().st_size == 0:
+                raise ApiError(400, "invalid_backup", "Request body must be the zip archive")
+            return await run_in_threadpool(
+                restore_backup,
+                upload,
+                owner=owner,
+                calendar_name=calendar,
+                replace=replace,
+                dry_run=dry_run,
+                max_member_bytes=max(limits["request"], limits["attachment"]) * 4,
+            )
+        finally:
+            delete_file_quietly(upload)
 
     @app.post(
         "/api/validate",

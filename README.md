@@ -319,7 +319,8 @@ curl -H "$H" "$B/api/calendars/main/personal/events?from=2026-11-01T00:00:00%2B0
 - `q` is a case-insensitive substring match on `SUMMARY`, `LOCATION`, and `DESCRIPTION`, useful for duplicate checks.
 - Floating times and all-day dates are interpreted in `tz` (default `DEFAULT_TIMEZONE`). `start_utc`/`end_utc` are normalised; `dtstart`/`dtend` show the stored value.
 - `rrule` is reported with its parts in canonical order (`FREQ` first, then alphabetical) so it can be compared reliably.
-- Pages hold up to `limit` items (default 200, max 1000). Follow `next_cursor` (also sent as a `Link: rel="next"` header) until `truncated` is `false`. Paging is keyset-based, so a full sweep returns every matching item exactly once; `total` is the number of matches when the page was produced. A cursor is only valid for the same query.
+- Pages hold up to `limit` items (default 200, max 1000). Follow `next_cursor` (also sent as a `Link: rel="next"` header) until `truncated` is `false`. Paging is keyset-based: on an unchanged calendar a full sweep returns every matching item exactly once, and `total` is the number of matches when the page was produced. An event edited during a sweep can move across the cursor and be seen twice or not at all, so use the change feed to catch up on edits. A cursor is only valid for the same query.
+- Series whose recurrence rule can never be expanded (for example `INTERVAL=0`, written by some client) are reported in `invalid_items` instead of stalling the request.
 - Every item names its `owner` and `calendar`. `invalid_items` lists files that could not be parsed, instead of hiding them.
 - `GET .../events` lists the calendar; an event whose UID is literally `events` can still be written, deleted, and exported but not read with a point `GET`.
 
@@ -342,7 +343,7 @@ A `412` response carries the current `ETag`. `PUT ...?dry_run=true` validates, e
 
 Point lookups also find events whose file name differs from their UID (as created by CalDAV clients), and a `PUT` updates that file instead of creating a duplicate.
 
-`PUT` rejects (400) input it cannot store faithfully: properties the parser would otherwise silently drop (for example an unparseable `DTEND` or `RRULE`), and events Radicale itself could not load, which CalDAV clients would never see (for example a series with more than 10,000 instances).
+`PUT` rejects (400) input it cannot store faithfully: properties the parser would otherwise silently drop (for example an unparseable `DTEND` or `RRULE`), recurrence rules that never advance (`INTERVAL=0`), and events Radicale itself could not load, which CalDAV clients would never see. Radicale's limit on instances of a finite series is raised from 10,000 to 100,000, so long series such as a daily event for 30 years are accepted.
 
 ### Batch changes
 
@@ -398,7 +399,12 @@ curl -X POST -H "$H" --data-binary @personal.ics "$B/api/calendars/main/personal
 
 - `format=ics` returns one `VCALENDAR` with every component and the needed `VTIMEZONE`s; `ATTACH` properties keep their URIs. The `Content-Digest` header carries its SHA-256 and `X-Event-Count` the number of events.
 - `format=zip` contains, per calendar, byte-exact event files, the calendar properties, and a `calendar.ics` bundle, plus attachment files and a `manifest.json` with SHA-256 digests to verify the backup.
-- Import splits a bundle by UID (a series keeps its overrides) and applies it atomically. `mode=upsert` (default) replaces existing UIDs, `mode=create` fails with 412 if any UID exists, and `mode=skip_existing` leaves existing UIDs untouched. `dry_run=true` previews. Non-`VEVENT` components are reported in `skipped_components`.
+- Restore a zip with `POST /api/restore` (body: the archive, `Content-Type: application/zip`). Every file is checked against the SHA-256 in `manifest.json` before anything is written; event files come back byte-for-byte (including copies that share a UID), together with calendar properties and the attachments in the archive. Calendars that already have events are refused with 409 unless `replace=true`, which makes them identical to the backup. `owner`/`calendar` restore a subset and `dry_run=true` reports what would change. The archive must fit in `MAX_REQUEST_BYTES` (and your proxy's body limit).
+- Import splits a bundle by UID (a series keeps its overrides) and applies it atomically. A bundle in which a UID appears as more than one event is refused with `duplicate_uids`; restore the zip instead. `mode=upsert` (default) replaces existing UIDs, `mode=create` fails with 412 if any UID exists, and `mode=skip_existing` leaves existing UIDs untouched. `dry_run=true` previews. Non-`VEVENT` components are reported in `skipped_components`.
+
+### Limits
+
+There is no server-side rate limiting, so no rate-limit headers are sent; put limits in the reverse proxy if you need them. Every list endpoint pages the same way (`limit`, an opaque cursor or token, `truncated`, and a `Link: rel="next"` header while more is available). Recurrence expansion is capped at 50,000 instances per request (422 beyond that).
 
 ### Validation
 
