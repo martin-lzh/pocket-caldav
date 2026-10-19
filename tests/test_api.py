@@ -537,7 +537,7 @@ def test_validate_reports_common_mistakes(client):
     no_vtimezone = client.post("/api/validate", json={"ics": ics("v-good", *lines)}).json()
     assert no_vtimezone["valid"] is True, no_vtimezone
     assert [issue["code"] for issue in no_vtimezone["warnings"]].count("vtimezone_not_embedded") == 1
-    assert "missing_vtimezone" in check(ics("v-good", *(line.replace("Europe/Berlin", "Mars/Olympus") for line in lines)))
+    assert "unresolvable_tzid" in check(ics("v-good", *(line.replace("Europe/Berlin", "Mars/Olympus") for line in lines)))
     assert "exdate_not_in_recurrence" in check(good.replace("EXDATE;TZID=Europe/Berlin:20261027T100000", "EXDATE;TZID=Europe/Berlin:20261027T090000"))
     assert "exdate_type_mismatch" in check(good.replace("EXDATE;TZID=Europe/Berlin:20261027T100000", "EXDATE;VALUE=DATE:20261027"))
     assert "unbalanced_component" in check(good.replace("END:VEVENT\r\n", ""))
@@ -593,3 +593,62 @@ def test_validate_and_put_agree_on_iana_tzid_without_vtimezone(client, calendar)
     assert report["valid"] is True and report["errors"] == []
     assert "vtimezone_not_embedded" in {issue["code"] for issue in report["warnings"]}
     assert put(client, calendar, "g1", body).status_code == 200
+
+
+OUTLOOK_TZ = """BEGIN:VTIMEZONE
+TZID:W. Europe Standard Time
+BEGIN:STANDARD
+DTSTART:16010101T030000
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:16010101T020000
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=3
+END:DAYLIGHT
+END:VTIMEZONE"""
+
+
+def test_writes_reject_unresolvable_tzid(client, calendar):
+    owner, name = calendar
+    mars = ics("mars", "DTSTART;TZID=Mars/Olympus:20261205T100000", "DTEND;TZID=Mars/Olympus:20261205T110000")
+    response = put(client, calendar, "mars", mars)
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "unresolvable_tzid" and error["details"]["tzids"] == ["Mars/Olympus"]
+    assert client.get(f"{base(calendar)}/mars").status_code == 404
+    report = client.post("/api/validate", json={"ics": mars}).json()
+    assert report["valid"] is False and "unresolvable_tzid" in {issue["code"] for issue in report["errors"]}
+
+    batch = client.post("/api/batch", json={"operations": [{"op": "put", "owner": owner, "calendar": name, "uid": "mars", "ics": mars}]})
+    assert batch.status_code == 400 and batch.json()["results"][0]["error_code"] == "unresolvable_tzid"
+    # An EXDATE in an unknown zone is just as ambiguous as DTSTART.
+    exdate = ics("mars-ex", "DTSTART;TZID=Europe/Berlin:20261205T100000", "DTEND;TZID=Europe/Berlin:20261205T110000",
+                 "RRULE:FREQ=DAILY;COUNT=3", "EXDATE;TZID=Mars/Olympus:20261206T100000")
+    assert put(client, calendar, "mars-ex", exdate).json()["error"]["code"] == "unresolvable_tzid"
+
+
+def test_non_iana_tzid_with_embedded_vtimezone_is_accepted(client, calendar):
+    body = "\r\n".join([
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:x", *OUTLOOK_TZ.splitlines(),
+        "BEGIN:VEVENT", "UID:outlook", "DTSTAMP:20261019T000000Z",
+        "DTSTART;TZID=W. Europe Standard Time:20261205T100000", "DTEND;TZID=W. Europe Standard Time:20261205T110000",
+        "SUMMARY:From Outlook", "END:VEVENT", "END:VCALENDAR", "",
+    ])
+    assert put(client, calendar, "outlook", body).status_code == 200
+    item = client.get(f"{base(calendar)}/events", params={"q": "outlook"}).json()["items"][0]
+    assert item["start_utc"] == "2026-12-05T09:00:00+00:00" and item["floating"] is False
+
+
+def test_floating_times_are_flagged(client, calendar):
+    put(client, calendar, "float", ics("float", "DTSTART:20261205T100000", "DTEND:20261205T110000", "SUMMARY:Floating"))
+    put(client, calendar, "zoned", ics("zoned", "DTSTART;TZID=Europe/Berlin:20261205T100000", "DTEND;TZID=Europe/Berlin:20261205T110000"))
+    listing = client.get(f"{base(calendar)}/events", params={"tz": "Europe/Berlin"}).json()
+    items = {item["uid"]: item for item in listing["items"]}
+    assert items["float"]["floating"] is True and items["float"]["dtstart"] == "2026-12-05T10:00:00"
+    assert items["float"]["start_utc"] == "2026-12-05T09:00:00+00:00" and listing["timezone"] == "Europe/Berlin"
+    assert items["zoned"]["floating"] is False
+    assert client.get(f"{base(calendar)}/float", params={"format": "json"}).json()["floating"] is True

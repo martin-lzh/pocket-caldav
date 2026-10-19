@@ -317,7 +317,7 @@ curl -H "$H" "$B/api/calendars/main/personal/events?from=2026-11-01T00:00:00%2B0
 - `from` (inclusive) and `to` (exclusive) must carry a timezone offset. Filtering uses overlap semantics (`start < to AND end > from`), so long-running and all-day events that started before the window are included. Events without `DTEND` last one day (all-day) or are instants (date-time).
 - Without `expand_recurrence`, a recurring series is one item (with its `rrule`) and matches when any instance overlaps. With `expand_recurrence=true` (requires `to`), each instance is an item with its `recurrence_id`; overrides are flagged with `is_override`.
 - `q` is a case-insensitive substring match on `SUMMARY`, `LOCATION`, and `DESCRIPTION`, useful for duplicate checks.
-- Floating times and all-day dates are interpreted in `tz` (default `DEFAULT_TIMEZONE`). `start_utc`/`end_utc` are normalised; `dtstart`/`dtend` show the stored value.
+- Floating times and all-day dates are interpreted in `tz` (default `DEFAULT_TIMEZONE`, else UTC), which the response echoes as `timezone`. `start_utc`/`end_utc` are normalised; `dtstart`/`dtend` show the stored value, and `floating: true` marks date-times stored without a zone, whose `start_utc` therefore depends on that choice.
 - `rrule` is reported with its parts in canonical order (`FREQ` first, then alphabetical) so it can be compared reliably.
 - Pages hold up to `limit` items (default 200, max 1000). Follow `next_cursor` (also sent as a `Link: rel="next"` header) until `truncated` is `false`. Paging is keyset-based: on an unchanged calendar a full sweep returns every matching item exactly once, and `total` is the number of matches when the page was produced. An event edited during a sweep can move across the cursor and be seen twice or not at all, so use the change feed to catch up on edits. A cursor is only valid for the same query.
 - Series whose recurrence rule can never be expanded (for example `INTERVAL=0`, written by some client) are reported in `invalid_items` instead of stalling the request.
@@ -343,7 +343,7 @@ A `412` response carries the current `ETag`. `PUT ...?dry_run=true` validates, e
 
 Point lookups also find events whose file name differs from their UID (as created by CalDAV clients), and a `PUT` updates that file instead of creating a duplicate.
 
-`PUT` rejects (400) input it cannot store faithfully: properties the parser would otherwise silently drop (for example an unparseable `DTEND` or `RRULE`), recurrence rules that never advance (`INTERVAL=0`), and events Radicale itself could not load, which CalDAV clients would never see. Radicale's limit on instances of a finite series is raised from 10,000 to 100,000, so long series such as a daily event for 30 years are accepted.
+`PUT` rejects (400) input it cannot store faithfully: properties the parser would otherwise silently drop (for example an unparseable `DTEND` or `RRULE`), recurrence rules that never advance (`INTERVAL=0`), `TZID`s that neither an embedded `VTIMEZONE` nor the IANA database defines (`unresolvable_tzid`; they would otherwise be read as floating time and shift by the UTC offset), and events Radicale itself could not load, which CalDAV clients would never see. Radicale's limit on instances of a finite series is raised from 10,000 to 100,000, so long series such as a daily event for 30 years are accepted.
 
 ### Batch changes
 
@@ -412,7 +412,7 @@ There is no server-side rate limiting, so no rate-limit headers are sent; put li
 curl -X POST -H "$H" -H 'Content-Type: application/json' "$B/api/validate" -d '{"ics": "BEGIN:VCALENDAR..."}'
 ```
 
-Returns `valid`, `errors`, and `warnings` (each with a `code`, a `message`, and a line number where one applies). Checks include malformed or unfolded lines, unbalanced components, missing `UID`/`DTSTAMP`/`DTSTART`, `DTEND`/`DURATION` conflicts, unparseable `RRULE`s, `TZID`s that neither a `VTIMEZONE` nor the IANA database defines (an IANA name such as `Europe/Berlin` without an embedded `VTIMEZONE` only warns with `vtimezone_not_embedded`), `EXDATE`s that match no occurrence or have the wrong value type, and whether CalDAV clients could load the event. `PUT` only enforces what it cannot store faithfully, so run this before writing.
+Returns `valid`, `errors`, and `warnings` (each with a `code`, a `message`, and a line number where one applies). Checks include malformed or unfolded lines, unbalanced components, missing `UID`/`DTSTAMP`/`DTSTART`, `DTEND`/`DURATION` conflicts, unparseable `RRULE`s, `TZID`s that neither a `VTIMEZONE` nor the IANA database defines (`unresolvable_tzid`, which `PUT` also rejects; an IANA name such as `Europe/Berlin` without an embedded `VTIMEZONE` only warns with `vtimezone_not_embedded`), `EXDATE`s that match no occurrence or have the wrong value type, and whether CalDAV clients could load the event. `PUT` only enforces what it cannot store faithfully, so run this before writing.
 
 ### CalDAV clients
 

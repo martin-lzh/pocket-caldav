@@ -130,6 +130,7 @@ class EventJSON(BaseModel):
     start: str | None = None
     end: str | None = Field(None, description="Exclusive end.")
     all_day: bool = False
+    floating: bool = Field(False, description="True when start is a date-time without zone; start_utc then assumes DEFAULT_TIMEZONE.")
     timezone: str | None = None
     duration: str | None = None
     start_utc: str | None = None
@@ -186,9 +187,10 @@ class EventSummary(BaseModel):
     status: str | None = None
     dtstart: str | None = Field(None, description="DTSTART as stored: ISO date for all-day, ISO date-time with offset, or naive ISO for floating times.")
     dtend: str | None = Field(None, description="Effective end (DTEND, or DTSTART + DURATION, or DTSTART + 1 day for all-day).")
-    start_utc: str | None = Field(None, description="Start in UTC; floating and all-day values are interpreted in the query `tz`.")
+    start_utc: str | None = Field(None, description="Start in UTC. Floating (see `floating`) and all-day values are interpreted in the response `timezone`.")
     end_utc: str | None = None
     all_day: bool = False
+    floating: bool = Field(False, description="True when DTSTART is a date-time without zone; start_utc/end_utc then assume the response `timezone`.")
     tzid: str | None = None
     rrule: str | None = Field(None, description="RRULE with parts in canonical order: FREQ first, then alphabetical.")
     is_recurring: bool = False
@@ -1229,12 +1231,35 @@ def listify(value: Any) -> list[Any]:
     return value if isinstance(value, list) else [value]
 
 
+def unresolvable_tzids(calendar: Calendar) -> list[str]:
+    """TZIDs that no embedded VTIMEZONE defines and that are not IANA names, in first-use order."""
+    defined = {str(tz.get("TZID")) for tz in calendar.walk("VTIMEZONE")}
+    found: list[str] = []
+    for component in calendar.subcomponents:
+        if component.name not in CALENDAR_COMPONENTS:
+            continue
+        for _prop, tzid in tzid_references(component):
+            if tzid not in defined and tzid not in found and not is_iana_timezone(tzid):
+                found.append(tzid)
+    return found
+
+
 def normalize_calendar(data: bytes, expected_uid: str) -> bytes:
     calendar = parse_calendar(data)
     problems = property_parse_errors(calendar) + degenerate_rrule_errors(calendar)
     if problems:
         # The parser would silently drop these properties; refuse instead of losing data.
         raise HTTPException(status_code=400, detail="Invalid iCalendar data: " + "; ".join(problems[:5]))
+    unresolvable = unresolvable_tzids(calendar)
+    if unresolvable:
+        # Unknown zones are parsed as floating times and would silently shift by the UTC offset.
+        raise ApiError(
+            400,
+            "unresolvable_tzid",
+            f"TZID {unresolvable[0]!r} is neither defined by a VTIMEZONE in the ICS nor an IANA time zone",
+            hint="Use an IANA name such as Europe/Berlin, or include a VTIMEZONE that defines the TZID.",
+            details={"tzids": unresolvable},
+        )
     uid = event_uid(calendar)
     if uid != expected_uid:
         raise ApiError(
@@ -2182,6 +2207,10 @@ def parse_query_datetime(value: str | None, name: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def is_floating(value: Any) -> bool:
+    return isinstance(value, datetime) and value.tzinfo is None
+
+
 def ical_value_iso(value: Any) -> str | None:
     if isinstance(value, (date, datetime)):
         return value.isoformat()
@@ -2262,6 +2291,7 @@ def event_summary(
         "start_utc": bounds.start_utc.isoformat() if bounds.start_utc else None,
         "end_utc": bounds.end_utc.isoformat() if bounds.end_utc else None,
         "all_day": bounds.all_day,
+        "floating": is_floating(bounds.start),
         "tzid": component_tzid(component),
         "rrule": rrule,
         "is_recurring": is_recurring,
@@ -2935,7 +2965,10 @@ def validate_ics(data: bytes, expected_uid: str | None = None) -> dict[str, Any]
                         f"TZID {tzid!r} has no VTIMEZONE; it is resolved as the IANA zone of that name",
                     )
             else:
-                error("missing_vtimezone", f"{label} {prop} references TZID {tzid!r} but no VTIMEZONE defines it")
+                error(
+                    "unresolvable_tzid",
+                    f"{label} {prop} references TZID {tzid!r}, which no VTIMEZONE defines and is not an IANA time zone",
+                )
         dtstart = decoded_or_none(event, "DTSTART")
         if not isinstance(dtstart, date):
             error("missing_dtstart", f"{label} has no valid DTSTART")
@@ -3991,6 +4024,7 @@ def event_to_json(owner: str, calendar_name: str, path: Path, data: bytes, tz: A
         "start": ical_value_iso(bounds.start),
         "end": ical_value_iso(bounds.end),
         "all_day": bounds.all_day,
+        "floating": is_floating(bounds.start),
         "timezone": event_zone_name(master) or component_tzid(master),
         "duration": duration_text(bounds.end_utc - bounds.start_utc) if bounds.start_utc and bounds.end_utc else None,
         "start_utc": bounds.start_utc.isoformat() if bounds.start_utc else None,
