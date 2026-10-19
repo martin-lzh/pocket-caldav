@@ -412,7 +412,7 @@ There is no server-side rate limiting, so no rate-limit headers are sent; put li
 curl -X POST -H "$H" -H 'Content-Type: application/json' "$B/api/validate" -d '{"ics": "BEGIN:VCALENDAR..."}'
 ```
 
-Returns `valid`, `errors`, and `warnings` (each with a `code`, a `message`, and a line number where one applies). Checks include malformed or unfolded lines, unbalanced components, missing `UID`/`DTSTAMP`/`DTSTART`, `DTEND`/`DURATION` conflicts, unparseable `RRULE`s, `TZID`s without a `VTIMEZONE`, `EXDATE`s that match no occurrence or have the wrong value type, and whether CalDAV clients could load the event. `PUT` only enforces what it cannot store faithfully, so run this before writing.
+Returns `valid`, `errors`, and `warnings` (each with a `code`, a `message`, and a line number where one applies). Checks include malformed or unfolded lines, unbalanced components, missing `UID`/`DTSTAMP`/`DTSTART`, `DTEND`/`DURATION` conflicts, unparseable `RRULE`s, `TZID`s that neither a `VTIMEZONE` nor the IANA database defines (an IANA name such as `Europe/Berlin` without an embedded `VTIMEZONE` only warns with `vtimezone_not_embedded`), `EXDATE`s that match no occurrence or have the wrong value type, and whether CalDAV clients could load the event. `PUT` only enforces what it cannot store faithfully, so run this before writing.
 
 ### CalDAV clients
 

@@ -2795,6 +2795,14 @@ def as_naive_or_aware(value: Any, reference: Any) -> Any:
     return value
 
 
+def is_iana_timezone(tzid: str) -> bool:
+    try:
+        ZoneInfo(tzid)
+    except (ZoneInfoNotFoundError, ValueError):
+        return False
+    return True
+
+
 def tzid_references(component: Any) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     for sub in component.walk():
@@ -2904,6 +2912,7 @@ def validate_ics(data: bytes, expected_uid: str | None = None) -> dict[str, Any]
         error("uid_mismatch", f"VEVENT UID {uid!r} does not match expected uid {expected_uid!r}")
 
     defined_tzids = {str(tz.get("TZID")) for tz in calendar.walk("VTIMEZONE")}
+    warned_tzids: set[str] = set()
     tz = default_timezone()
     master_rule = None
     for event in events:
@@ -2914,7 +2923,18 @@ def validate_ics(data: bytes, expected_uid: str | None = None) -> dict[str, Any]
         if event.get("DTSTAMP") is None:
             error("missing_dtstamp", f"{label} has no DTSTAMP")
         for prop, tzid in tzid_references(event):
-            if tzid not in defined_tzids:
+            if tzid in defined_tzids:
+                continue
+            if is_iana_timezone(tzid):
+                # RFC 5545 asks for a VTIMEZONE, but IANA names resolve everywhere
+                # (this server, Radicale, Apple Calendar, DAVx5); PUT accepts them.
+                if tzid not in warned_tzids:
+                    warned_tzids.add(tzid)
+                    warning(
+                        "vtimezone_not_embedded",
+                        f"TZID {tzid!r} has no VTIMEZONE; it is resolved as the IANA zone of that name",
+                    )
+            else:
                 error("missing_vtimezone", f"{label} {prop} references TZID {tzid!r} but no VTIMEZONE defines it")
         dtstart = decoded_or_none(event, "DTSTART")
         if not isinstance(dtstart, date):
@@ -5246,7 +5266,8 @@ def create_app() -> FastAPI:
     )
     def api_validate_event(payload: ValidateRequest) -> dict[str, Any]:
         """Checks line syntax and folding, component nesting, UID/DTSTAMP/DTSTART,
-        DTEND/DURATION consistency, RRULE parsing, TZIDs without a VTIMEZONE,
+        DTEND/DURATION consistency, RRULE parsing, TZIDs that are neither embedded
+        nor IANA names (an IANA TZID without a VTIMEZONE only warns),
         EXDATEs that miss every occurrence, and whether CalDAV clients can load it.
         PUT only rejects input it cannot store faithfully; see `errors` for the rest.
         """

@@ -533,7 +533,11 @@ def test_validate_reports_common_mistakes(client):
     assert "missing_dtstamp" in check(good.replace("DTSTAMP:20260101T000000Z\r\n", ""))
     assert "missing_uid" in check(good.replace("UID:v-good\r\n", ""))
     assert "invalid_property" in check(good.replace("FREQ=WEEKLY", "FREQ=SOMETIMES"))
-    assert "missing_vtimezone" in check(ics("v-good", *lines))
+    # An IANA TZID without an embedded VTIMEZONE is resolvable, so it only warns.
+    no_vtimezone = client.post("/api/validate", json={"ics": ics("v-good", *lines)}).json()
+    assert no_vtimezone["valid"] is True, no_vtimezone
+    assert [issue["code"] for issue in no_vtimezone["warnings"]].count("vtimezone_not_embedded") == 1
+    assert "missing_vtimezone" in check(ics("v-good", *(line.replace("Europe/Berlin", "Mars/Olympus") for line in lines)))
     assert "exdate_not_in_recurrence" in check(good.replace("EXDATE;TZID=Europe/Berlin:20261027T100000", "EXDATE;TZID=Europe/Berlin:20261027T090000"))
     assert "exdate_type_mismatch" in check(good.replace("EXDATE;TZID=Europe/Berlin:20261027T100000", "EXDATE;VALUE=DATE:20261027"))
     assert "unbalanced_component" in check(good.replace("END:VEVENT\r\n", ""))
@@ -576,3 +580,16 @@ def test_openapi_documents_new_routes(client):
     put_doc = paths["/api/calendars/{owner}/{calendar_name}/{uid}"]["put"]
     assert "412" in put_doc["responses"] and "text/calendar" in put_doc["requestBody"]["content"]
     assert "description" in paths["/api/cleanup"]["post"]
+
+
+def test_validate_and_put_agree_on_iana_tzid_without_vtimezone(client, calendar):
+    # Reported case: a standard Olson TZID and no VTIMEZONE (common in client exports).
+    body = "\r\n".join([
+        "BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "UID:g1", "DTSTAMP:20261019T000000Z",
+        "DTSTART;TZID=Europe/Berlin:20261205T100000", "DTEND;TZID=Europe/Berlin:20261205T110000",
+        "SUMMARY:ok", "END:VEVENT", "END:VCALENDAR", "",
+    ])
+    report = client.post("/api/validate", json={"ics": body}).json()
+    assert report["valid"] is True and report["errors"] == []
+    assert "vtimezone_not_embedded" in {issue["code"] for issue in report["warnings"]}
+    assert put(client, calendar, "g1", body).status_code == 200
