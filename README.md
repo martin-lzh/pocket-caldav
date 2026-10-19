@@ -275,6 +275,37 @@ Invoke-RestMethod `
 The full, machine-readable contract is served at `/openapi.json` and `/docs`.
 The examples below use `curl` with `H='X-API-Key: <api-key>'` and `B=http://127.0.0.1:5232`.
 
+### For AI agents
+
+The API is designed to be driven by agents. Point the agent at `GET /api/guide` (plain Markdown, no key needed): it lists the conventions and one call per common task. `/openapi.json` has stable, readable `operationId`s (`create_event`, `patch_event`, `search_events`, ...) for tool generation.
+
+**JSON events** — no iCalendar needed. The server writes valid ICS (DTSTAMP, VTIMEZONE, line folding, UTC `UNTIL`):
+
+```bash
+curl -X POST -H "$H" -H 'Content-Type: application/json' "$B/api/calendars/main/personal/events" -d '{
+  "summary": "Standup", "start": "2026-11-02T09:00", "duration": "PT15M", "timezone": "Europe/Berlin",
+  "rrule": "FREQ=WEEKLY;BYDAY=MO;UNTIL=2027-06-30", "alarms": [{"minutes_before": 10}]
+}'
+curl -H "$H" "$B/api/calendars/main/personal/<uid>?format=json"
+curl -X PATCH -H "$H" -H 'If-Match: "<etag>"' -H 'Content-Type: application/json' \
+  "$B/api/calendars/main/personal/<uid>" -d '{"start": "2026-11-02T10:00", "add_exdates": ["2026-12-21T10:00"]}'
+```
+
+- Fields: `summary` (alias `title`), `start`, `end` or `duration`, `timezone`, `location`, `description`, `url`, `status`, `busy`, `categories`, `rrule`, `exdates`, `alarms`; PATCH also takes `add_exdates`. A date (`2026-11-27`) makes an all-day event; a date-time without offset is wall-clock time in `timezone`. Ends are exclusive. Unknown fields are rejected, so typos surface instead of being ignored.
+- Create refuses duplicates: an event with the same title (case and spacing ignored) and start in the same calendar returns `409 duplicate_event` with the existing copy in `error.details.duplicates`. Use `on_duplicate: "return_existing"` for idempotent retries or `"allow"` for intentional copies. A UID is generated unless you pass `uid`.
+- PATCH changes only the fields you send (`null` removes one). Moving `start` keeps the duration and moves EXDATEs and overrides with the series. Properties the JSON view does not model are preserved and listed in `other_properties`. `SEQUENCE`, `DTSTAMP`, and `LAST-MODIFIED` are maintained for CalDAV clients.
+- Every write returns the stored `event` and its `etag`; `dry_run=true` previews it.
+
+**Errors** keep FastAPI's `detail` and add a structured object:
+
+```json
+{"detail": "...", "error": {"code": "duplicate_event", "message": "...", "hint": "what to do next", "retryable": false, "details": {...}}}
+```
+
+Branch on `error.code` (for example `event_not_found`, `calendar_not_found`, `duplicate_event`, `uid_exists`, `precondition_failed`, `invalid_field`, `invalid_event`, `invalid_request`, `cursor_mismatch`, `token_expired`, `unknown_endpoint`). A `412` includes `details.current_etag`.
+
+**Search across calendars**: `GET /api/events?q=...&from=...&to=...` uses the same filters and paging as a single calendar, and `GET /api/events?uid=<uid>` finds every copy of an event in any calendar. `GET /api/calendars` lists calendars with their event counts.
+
 ### Listing and searching events
 
 ```bash
@@ -289,7 +320,7 @@ curl -H "$H" "$B/api/calendars/main/personal/events?from=2026-11-01T00:00:00%2B0
 - Floating times and all-day dates are interpreted in `tz` (default `DEFAULT_TIMEZONE`). `start_utc`/`end_utc` are normalised; `dtstart`/`dtend` show the stored value.
 - `rrule` is reported with its parts in canonical order (`FREQ` first, then alphabetical) so it can be compared reliably.
 - Pages hold up to `limit` items (default 200, max 1000). Follow `next_cursor` (also sent as a `Link: rel="next"` header) until `truncated` is `false`. Paging is keyset-based, so a full sweep returns every matching item exactly once; `total` is the number of matches when the page was produced. A cursor is only valid for the same query.
-- `invalid_items` lists files in the collection that could not be parsed, instead of hiding them.
+- Every item names its `owner` and `calendar`. `invalid_items` lists files that could not be parsed, instead of hiding them.
 - `GET .../events` lists the calendar; an event whose UID is literally `events` can still be written, deleted, and exported but not read with a point `GET`.
 
 ### ETags and conditional requests

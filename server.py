@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import argparse
 import base64
+import calendar as calendar_module
 import getpass
 import hashlib
 import json
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -38,14 +40,18 @@ import bcrypt
 import recurring_ical_events
 from dateutil import rrule as dateutil_rrule
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.wsgi import WSGIMiddleware
+from fastapi.routing import APIRoute
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from icalendar import Calendar
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -105,6 +111,62 @@ class CalendarInfo(BaseModel):
     path: str
 
 
+class CalendarListEntry(CalendarInfo):
+    event_count: int
+
+
+class CalendarListResponse(BaseModel):
+    calendars: list[CalendarListEntry]
+
+
+class EventJSON(BaseModel):
+    owner: str
+    calendar: str
+    uid: str
+    href: str
+    etag: str
+    summary: str | None = None
+    start: str | None = None
+    end: str | None = Field(None, description="Exclusive end.")
+    all_day: bool = False
+    timezone: str | None = None
+    duration: str | None = None
+    start_utc: str | None = None
+    end_utc: str | None = None
+    location: str | None = None
+    description: str | None = None
+    url: str | None = None
+    status: str | None = None
+    busy: bool | None = None
+    categories: list[str] = Field(default_factory=list)
+    rrule: str | None = None
+    exdates: list[str | None] = Field(default_factory=list)
+    rdates: list[str | None] = Field(default_factory=list)
+    overrides: list[dict[str, Any]] = Field(default_factory=list, description="RECURRENCE-ID instances that differ from the series.")
+    alarms: list[dict[str, Any]] = Field(default_factory=list)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    sequence: int = 0
+    other_properties: list[str] = Field(default_factory=list, description="Stored properties not shown here; PATCH preserves them.")
+    last_modified: str | None = None
+
+
+class EventWriteResponse(BaseModel):
+    created: bool
+    dry_run: bool
+    etag: str
+    event: EventJSON
+    duplicate_of: str | None = None
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class EventPatchResponse(BaseModel):
+    dry_run: bool
+    etag: str
+    changed_fields: list[str]
+    event: EventJSON
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class CalendarDeleteResult(BaseModel):
     deleted: bool
     owner: str
@@ -114,6 +176,8 @@ class CalendarDeleteResult(BaseModel):
 
 
 class EventSummary(BaseModel):
+    owner: str
+    calendar: str
     uid: str
     href: str = Field(..., description="File name of the event inside the calendar collection.")
     summary: str | None = None
@@ -135,6 +199,8 @@ class EventSummary(BaseModel):
 
 
 class InvalidItem(BaseModel):
+    owner: str
+    calendar: str
     href: str
     error: str
 
@@ -230,6 +296,7 @@ class BatchOperationResult(BaseModel):
     created: bool | None = None
     deleted: bool | None = None
     error: str | None = None
+    error_code: str | None = None
 
 
 class BatchResponse(BaseModel):
@@ -1110,9 +1177,11 @@ def normalize_calendar(data: bytes, expected_uid: str) -> bytes:
         raise HTTPException(status_code=400, detail="Invalid iCalendar data: " + "; ".join(problems[:5]))
     uid = event_uid(calendar)
     if uid != expected_uid:
-        raise HTTPException(
-            status_code=409,
-            detail=f"VEVENT UID {uid!r} does not match URL uid {expected_uid!r}",
+        raise ApiError(
+            409,
+            "uid_mismatch",
+            f"VEVENT UID {uid!r} does not match URL uid {expected_uid!r}",
+            hint="The UID inside the ICS must equal the {uid} path segment.",
         )
     return calendar.to_ical()
 
@@ -1273,7 +1342,7 @@ def read_event(owner: str, calendar: str, uid: str) -> tuple[Path, bytes, os.sta
 def load_event(owner: str, calendar: str, uid: str) -> bytes:
     found = read_event(owner, calendar, uid)
     if found is None:
-        raise HTTPException(status_code=404, detail="Event not found")
+        raise ApiError(404, "event_not_found", "Event not found")
     return found[1]
 
 
@@ -2036,6 +2105,8 @@ def event_summary(
     component: Any,
     bounds: Bounds,
     *,
+    owner: str,
+    calendar: str,
     uid: str,
     rrule: str | None,
     is_recurring: bool,
@@ -2044,6 +2115,8 @@ def event_summary(
 ) -> dict[str, Any]:
     status = component_text(component, "STATUS")
     return {
+        "owner": owner,
+        "calendar": calendar,
         "uid": uid,
         "href": item.href,
         "summary": component_text(component, "SUMMARY"),
@@ -2066,26 +2139,29 @@ def event_summary(
 
 
 def collect_event_entries(
-    owner: str,
-    calendar: str,
+    scopes: list[tuple[str, str]],
     *,
     range_from: datetime | None,
     range_to: datetime | None,
     expand: bool,
     query: str | None,
     tz: Any,
+    uid_filter: str | None = None,
 ) -> tuple[list[tuple[tuple[Any, ...], dict[str, Any]]], list[dict[str, str]]]:
     entries: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     invalid: list[dict[str, str]] = []
     budget = [MAX_EXPANDED_INSTANCES]
     needle = query.casefold() if query else None
     windowed = range_from is not None or range_to is not None
-    for path in iter_collection_files(owner, calendar):
+    paths = [(owner, calendar, path) for owner, calendar in scopes for path in iter_collection_files(owner, calendar)]
+    for owner, calendar, path in paths:
         item = read_stored_item(path)
         if item is None:
             continue
         if item.calendar is None:
-            invalid.append({"href": item.href, "error": item.error or "Invalid iCalendar data"})
+            invalid.append({"owner": owner, "calendar": calendar, "href": item.href, "error": item.error or "Invalid iCalendar data"})
+            continue
+        if uid_filter is not None and item.uid != uid_filter:
             continue
         events = list(item.calendar.walk("VEVENT"))
         if not events:
@@ -2110,13 +2186,15 @@ def collect_event_entries(
                         item,
                         occurrence,
                         bounds,
+                        owner=owner,
+                        calendar=calendar,
                         uid=uid,
                         rrule=rrule,
                         is_recurring=recurring,
                         recurrence_id=ical_value_iso(recurrence_value),
                         is_override=epoch_microseconds(recurrence_utc) in overrides,
                     )
-                    key = (epoch_microseconds(bounds.start_utc), uid, epoch_microseconds(recurrence_utc), item.href)
+                    key = (epoch_microseconds(bounds.start_utc), uid, epoch_microseconds(recurrence_utc), owner, calendar, item.href)
                     entries.append((key, summary))
                 continue
             if needle and not any(component_matches(event, needle) for event in events):
@@ -2133,18 +2211,20 @@ def collect_event_entries(
                 item,
                 master,
                 bounds,
+                owner=owner,
+                calendar=calendar,
                 uid=uid,
                 rrule=rrule,
                 is_recurring=recurring,
                 recurrence_id=ical_value_iso(recurrence_value),
                 is_override=recurrence_value is not None,
             )
-            key = (epoch_microseconds(bounds.start_utc), uid, epoch_microseconds(None), item.href)
+            key = (epoch_microseconds(bounds.start_utc), uid, epoch_microseconds(None), owner, calendar, item.href)
             entries.append((key, summary))
         except HTTPException:
             raise
         except Exception as exc:
-            invalid.append({"href": item.href, "error": f"Recurrence expansion failed: {exc}"[:300]})
+            invalid.append({"owner": owner, "calendar": calendar, "href": item.href, "error": f"Recurrence expansion failed: {exc}"[:300]})
     entries.sort(key=lambda entry: entry[0])
     return entries, invalid
 
@@ -2197,7 +2277,7 @@ def event_attachment_records(owner: str, calendar: str, uid: str) -> list[dict[s
 def list_event_attachments(owner: str, calendar: str, uid: str) -> dict[str, Any]:
     found = read_event(owner, calendar, uid)
     if found is None:
-        raise HTTPException(status_code=404, detail="Event not found")
+        raise ApiError(404, "event_not_found", "Event not found")
     _path, data, _stat = found
     try:
         parsed = Calendar.from_ical(data)
@@ -2257,7 +2337,7 @@ def find_attachment_record(owner: str, calendar: str, uid: str, attachment_id: s
     for record in event_attachment_records(owner, calendar, uid):
         if record.get("id") == attachment_id:
             return record
-    raise HTTPException(status_code=404, detail="Attachment not found")
+    raise ApiError(404, "attachment_not_found", "Attachment not found", hint="GET .../{uid}/attachments lists attachment ids.")
 
 
 def delete_event_attachment(owner: str, calendar: str, uid: str, attachment_id: str, if_match: str | None) -> str:
@@ -2265,7 +2345,7 @@ def delete_event_attachment(owner: str, calendar: str, uid: str, attachment_id: 
     with storage_lock():
         found = read_event(owner, calendar, uid)
         if found is None:
-            raise HTTPException(status_code=404, detail="Event not found")
+            raise ApiError(404, "event_not_found", "Event not found")
         path, data, _stat = found
         check_write_preconditions(compute_etag(data), if_match, None)
         record = find_attachment_record(owner, calendar, uid, attachment_id)
@@ -2330,7 +2410,7 @@ async def store_uploaded_attachment(
         with storage_lock():
             found = read_event(owner, calendar_name, uid)
             if found is None:
-                raise HTTPException(status_code=404, detail="Event not found")
+                raise ApiError(404, "event_not_found", "Event not found")
             updated = add_attachment_to_ics(found[1], public_uri, content_type, original_name)
             commit_writes([PlannedWrite(owner, calendar_name, uid, found[0], updated)], "attachment")
             event_end = event_end_from_ics(updated)
@@ -2781,7 +2861,7 @@ def execute_batch(ops: list[BatchOp], *, dry_run: bool, source: str, max_ics_byt
 
     def fail(index: int, exc: HTTPException) -> None:
         nonlocal failed_index
-        results[index].update(status=exc.status_code, outcome="failed", error=str(exc.detail))
+        results[index].update(status=exc.status_code, outcome="failed", error=str(exc.detail), error_code=error_payload(exc)["code"])
         if failed_index is None:
             failed_index = index
 
@@ -3017,12 +3097,15 @@ def delete_calendar(owner: str, calendar: str, force: bool) -> dict[str, Any]:
     with storage_lock():
         directory = collection_path(owner, calendar)
         if not directory.is_dir():
-            raise HTTPException(status_code=404, detail="Calendar not found")
+            raise ApiError(404, "calendar_not_found", "Calendar not found", hint="GET /api/calendars lists existing calendars.")
         files = iter_collection_files(owner, calendar)
         if files and not force:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Calendar contains {len(files)} event(s); export it first, then retry with ?force=true",
+            raise ApiError(
+                409,
+                "calendar_not_empty",
+                f"Calendar contains {len(files)} event(s); export it first, then retry with ?force=true",
+                hint="GET /api/export?format=zip&owner=...&calendar=... first, then DELETE with force=true.",
+                details={"event_count": len(files)},
             )
         journal_sync([(owner, calendar)], "external")
         attachments_deleted = delete_managed_attachments_for_calendar(owner, calendar)
@@ -3038,6 +3121,753 @@ def delete_calendar(owner: str, calendar: str, force: bool) -> dict[str, Any]:
         "events_deleted": len(files),
         "attachments_deleted": attachments_deleted,
     }
+
+
+# ---------------------------------------------------------------------------
+# Structured errors
+# ---------------------------------------------------------------------------
+
+
+class ApiError(HTTPException):
+    """HTTPException with a stable machine-readable code and a hint for the caller.
+
+    The response keeps FastAPI's `detail` string and adds an `error` object.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        hint: str | None = None,
+        details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(status_code=status_code, detail=message, headers=headers)
+        self.code = code
+        self.hint = hint
+        self.details = details
+
+
+DEFAULT_ERROR_CODES = {
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    409: "conflict",
+    410: "token_expired",
+    412: "precondition_failed",
+    413: "payload_too_large",
+    422: "invalid_request",
+    500: "internal_error",
+}
+DEFAULT_ERROR_HINTS = {
+    401: "Send the management key in the X-API-Key header.",
+    410: "Discard the token and start again without `since`/`cursor`, then rebuild local state from a full listing.",
+    412: "Re-read the event (GET) to get its current ETag, re-apply your change to that version, and retry with If-Match set to the new ETag.",
+    413: "Split the request: fewer operations per batch, or a smaller event/attachment.",
+}
+
+
+def error_payload(exc: HTTPException) -> dict[str, Any]:
+    status = exc.status_code
+    payload: dict[str, Any] = {
+        "code": getattr(exc, "code", None) or DEFAULT_ERROR_CODES.get(status, f"http_{status}"),
+        "message": exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail, default=str),
+        "status": status,
+        # 412 is safe to retry once the caller has refreshed its copy; 5xx may be transient.
+        "retryable": status in {412, 429, 500, 502, 503, 504},
+    }
+    hint = getattr(exc, "hint", None) or DEFAULT_ERROR_HINTS.get(status)
+    if hint:
+        payload["hint"] = hint
+    details = getattr(exc, "details", None)
+    if details:
+        payload["details"] = details
+    if status == 412 and exc.headers and exc.headers.get("ETag"):
+        payload.setdefault("details", {})["current_etag"] = exc.headers["ETag"]
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# JSON events: the agent-facing representation
+# ---------------------------------------------------------------------------
+
+ICAL_WEEKDAYS = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+AGENT_PRODID = "-//Pocket CalDAV//Agent API//EN"
+
+
+def zone_transitions(zone: ZoneInfo, year: int) -> list[tuple[datetime, timedelta, timedelta]]:
+    transitions: list[tuple[datetime, timedelta, timedelta]] = []
+    cursor = datetime(year, 1, 1, tzinfo=timezone.utc)
+    end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    previous = cursor.astimezone(zone).utcoffset()
+    while cursor < end:
+        following = cursor + timedelta(days=1)
+        offset = following.astimezone(zone).utcoffset()
+        if offset != previous:
+            low, high = cursor, following
+            while high - low > timedelta(minutes=1):
+                middle = low + (high - low) / 2
+                if middle.astimezone(zone).utcoffset() == previous:
+                    low = middle
+                else:
+                    high = middle
+            transitions.append((high, previous, offset))
+            previous = offset
+        cursor = following
+    return transitions
+
+
+def build_vtimezone(tzid: str, year: int) -> Any:
+    """Compact VTIMEZONE (yearly RRULEs, like Apple Calendar writes) for the rules in force in `year`."""
+    from icalendar import Timezone, TimezoneDaylight, TimezoneStandard
+
+    zone = ZoneInfo(tzid)
+    transitions = zone_transitions(zone, year)
+    if len(transitions) not in (0, 2):
+        return Timezone.from_tzid(tzid)  # irregular rules: let icalendar enumerate them
+    vtimezone = Timezone()
+    vtimezone.add("TZID", tzid)
+    if not transitions:
+        reference = datetime(year, 1, 1, tzinfo=timezone.utc).astimezone(zone)
+        standard = TimezoneStandard()
+        standard.add("DTSTART", datetime(1970, 1, 1))
+        standard.add("TZOFFSETFROM", reference.utcoffset())
+        standard.add("TZOFFSETTO", reference.utcoffset())
+        standard.add("TZNAME", reference.tzname())
+        vtimezone.add_component(standard)
+        return vtimezone
+    for instant, before, after in transitions:
+        local = (instant + before).replace(tzinfo=None, second=0, microsecond=0)
+        days_in_month = calendar_module.monthrange(local.year, local.month)[1]
+        nth = -1 if local.day + 7 > days_in_month else (local.day - 1) // 7 + 1
+        weekday = local.weekday()
+        if nth > 0:
+            first = date(1970, local.month, 1)
+            first_day = first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (nth - 1))
+        else:
+            last = date(1970, local.month, calendar_module.monthrange(1970, local.month)[1])
+            first_day = last - timedelta(days=(last.weekday() - weekday) % 7)
+        after_local = instant.astimezone(zone)
+        part = TimezoneDaylight() if after_local.dst() else TimezoneStandard()
+        part.add("DTSTART", datetime.combine(first_day, local.time()))
+        part.add("TZOFFSETFROM", before)
+        part.add("TZOFFSETTO", after)
+        part.add("TZNAME", after_local.tzname())
+        part.add("RRULE", {"FREQ": "YEARLY", "BYMONTH": local.month, "BYDAY": f"{nth}{ICAL_WEEKDAYS[weekday]}"})
+        vtimezone.add_component(part)
+    return vtimezone
+
+
+def add_missing_vtimezones(calendar: Calendar) -> None:
+    """Add a VTIMEZONE for every IANA TZID the events reference but do not define."""
+    defined = {str(sub.get("TZID")) for sub in calendar.subcomponents if sub.name == "VTIMEZONE"}
+    events = [sub for sub in calendar.subcomponents if sub.name in CALENDAR_COMPONENTS]
+    needed = sorted({tzid for event in events for _prop, tzid in tzid_references(event)} - defined)
+    if not needed:
+        return
+    starts = [decoded_or_none(event, "DTSTART") for event in events]
+    years = [value.year for value in starts if isinstance(value, date)]
+    year = min(years) if years else datetime.now(timezone.utc).year
+    position = next((index for index, sub in enumerate(calendar.subcomponents) if sub.name in CALENDAR_COMPONENTS), 0)
+    for tzid in needed:
+        try:
+            vtimezone = build_vtimezone(tzid, max(year, 1971))
+        except (ZoneInfoNotFoundError, ValueError):
+            continue  # not an IANA name; validation reports it
+        calendar.subcomponents.insert(position, vtimezone)
+        position += 1
+
+
+class AlarmSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    minutes_before: int = Field(..., ge=0, le=60 * 24 * 28, description="Minutes before the start.")
+    description: str | None = Field(None, max_length=500)
+
+
+class EventFields(BaseModel):
+    """Writable event fields. In PATCH, omitted fields stay as they are and null removes a field."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    summary: str | None = Field(
+        None,
+        max_length=1000,
+        validation_alias=AliasChoices("summary", "title"),
+        examples=["Dentist"],
+        description="Title. `title` is accepted as an alias.",
+    )
+    start: str | None = Field(
+        None,
+        examples=["2026-11-27T15:00:00", "2026-11-27"],
+        description="ISO date (all-day event) or date-time. A date-time without offset is wall-clock time in `timezone`.",
+    )
+    end: str | None = Field(
+        None,
+        examples=["2026-11-27T16:00:00", "2026-11-28"],
+        description="Exclusive end, same kind as `start`. A one-day all-day event on 2026-11-27 ends 2026-11-28.",
+    )
+    duration: str | None = Field(None, examples=["PT1H30M", "P2D"], description="ISO 8601 duration; alternative to `end`.")
+    timezone: str | None = Field(
+        None,
+        examples=["Europe/Berlin"],
+        description="IANA zone for `start`, `end`, `exdates` and RRULE UNTIL without offset. Defaults to the event's current zone, then DEFAULT_TIMEZONE.",
+    )
+    location: str | None = Field(None, max_length=2000)
+    description: str | None = Field(None, max_length=50_000)
+    url: str | None = Field(None, max_length=2000)
+    status: Literal["CONFIRMED", "TENTATIVE", "CANCELLED"] | None = None
+    busy: bool | None = Field(None, description="false marks the time as free (TRANSP:TRANSPARENT).")
+    categories: list[str] | None = None
+    rrule: str | None = Field(
+        None,
+        examples=["FREQ=WEEKLY;BYDAY=MO;UNTIL=2027-06-30"],
+        description="RFC 5545 recurrence rule. UNTIL may be a date or local date-time; it is converted to the form RFC 5545 requires.",
+    )
+    exdates: list[str] | None = Field(None, description="Excluded instance starts (replaces the list). Same kind and zone as `start`.")
+    add_exdates: list[str] | None = Field(None, description="PATCH only: instance starts to exclude in addition to the existing ones.")
+    alarms: list[AlarmSpec] | None = Field(None, description="Replaces all reminders.")
+
+
+class EventCreate(EventFields):
+    uid: str | None = Field(None, description=f"Optional UID matching {SEGMENT_RE.pattern}; a UUID is generated when omitted.")
+    on_duplicate: Literal["error", "return_existing", "allow"] = Field(
+        "error",
+        description="What to do when the calendar already has an event with the same title and start: "
+        "`error` (409 with the duplicates), `return_existing` (200 with the first duplicate), or `allow`.",
+    )
+
+
+class EventPatch(EventFields):
+    pass
+
+
+def invalid_field(field: str, message: str, hint: str | None = None) -> ApiError:
+    return ApiError(400, "invalid_field", f"{field}: {message}", hint=hint, details={"field": field})
+
+
+def resolve_zone_field(name: str, field: str = "timezone") -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise invalid_field(field, f"unknown IANA timezone {name!r}", "Use a name such as Europe/Berlin or UTC.") from exc
+
+
+def parse_event_time(value: str, zone: ZoneInfo, field: str) -> date:
+    text = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return date.fromisoformat(text)
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise invalid_field(field, f"{value!r} is not an ISO 8601 date or date-time", "Examples: 2026-11-27, 2026-11-27T15:00:00, 2026-11-27T15:00:00+01:00.") from exc
+    parsed = parsed.replace(microsecond=0)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=zone)
+    # An explicit offset is converted to wall-clock time in the event's zone.
+    return parsed.astimezone(zone)
+
+
+def parse_duration_field(value: str) -> timedelta:
+    from icalendar import vDuration
+
+    try:
+        parsed = vDuration.from_ical(value.strip().upper())
+    except Exception as exc:
+        raise invalid_field("duration", f"{value!r} is not an ISO 8601 duration", "Examples: PT30M, PT1H30M, P1D.") from exc
+    if parsed <= timedelta(0):
+        raise invalid_field("duration", "must be positive")
+    return parsed
+
+
+def parse_rrule_field(value: str, start: date) -> Any:
+    from icalendar import vRecur
+
+    text = re.sub(r"^\s*RRULE:", "", value.strip(), flags=re.IGNORECASE)
+    # Accept ISO dates/times in UNTIL (2027-06-30, 2027-06-30T10:00:00).
+    text = re.sub(
+        r"UNTIL=(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):?(\d{2}):?(\d{2})?)?(Z?)",
+        lambda m: "UNTIL=" + m.group(1) + m.group(2) + m.group(3)
+        + (f"T{m.group(4)}{m.group(5)}{m.group(6) or '00'}" if m.group(4) else "") + m.group(7),
+        text,
+        flags=re.IGNORECASE,
+    )
+    try:
+        rule = vRecur.from_ical(text)
+    except Exception as exc:
+        raise invalid_field("rrule", f"cannot parse {value!r}: {exc}", "Example: FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=2027-06-30") from exc
+    if "FREQ" not in rule:
+        raise invalid_field("rrule", "FREQ is required", "Example: FREQ=DAILY;COUNT=5")
+    untils = rule.get("UNTIL")
+    if untils:
+        normalized = []
+        for until in untils:
+            if isinstance(start, datetime):
+                if not isinstance(until, datetime):
+                    until = datetime.combine(until, datetime_time(23, 59, 59))
+                if until.tzinfo is None:
+                    until = until.replace(tzinfo=start.tzinfo)
+                until = until.astimezone(timezone.utc)
+            elif isinstance(until, datetime):
+                until = until.date()
+            normalized.append(until)
+        rule["UNTIL"] = normalized
+    try:
+        dateutil_rrule.rrulestr(rule.to_ical().decode("utf-8"), dtstart=as_naive_or_aware(start, start))
+    except Exception as exc:
+        raise invalid_field("rrule", f"invalid recurrence rule: {exc}") from exc
+    return rule
+
+
+def event_zone_name(event: Any) -> str | None:
+    value = decoded_or_none(event, "DTSTART")
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return getattr(value.tzinfo, "key", None)
+    return None
+
+
+def set_property(event: Any, name: str, value: Any) -> None:
+    event.pop(name, None)
+    if value is not None and value != "" and value != []:
+        event.add(name, value)
+
+
+def date_kind(value: date) -> str:
+    return "date-time" if isinstance(value, datetime) else "date"
+
+
+def wall_clock(value: date) -> date:
+    """Local wall-clock value (naive datetime or date) of a DTSTART-like value."""
+    return value.replace(tzinfo=None) if isinstance(value, datetime) else value
+
+
+def shift_wall_clock(value: date, delta: timedelta, old_zone: Any, new_zone: Any) -> date:
+    if isinstance(value, datetime):
+        naive = value.astimezone(old_zone).replace(tzinfo=None) if value.tzinfo else value
+        return (naive + delta).replace(tzinfo=new_zone)
+    return value + delta
+
+
+def apply_event_fields(calendar: Calendar, event: Any, fields: dict[str, Any], *, creating: bool) -> None:
+    """Apply JSON fields to the series master; omitted fields are untouched, None removes."""
+    zone_name = fields.get("timezone") or event_zone_name(event) or default_timezone_name()
+    zone = resolve_zone_field(zone_name)
+
+    old_start = decoded_or_none(event, "DTSTART")
+    old_bounds = component_bounds(event, zone)
+    time_fields = {"start", "end", "duration", "timezone"} & fields.keys()
+    if creating or time_fields:
+        if fields.get("start") is not None:
+            new_start = parse_event_time(fields["start"], zone, "start")
+        elif isinstance(old_start, datetime):
+            # Keep the wall-clock time; a new `timezone` re-anchors it in that zone.
+            new_start = wall_clock(old_start).replace(tzinfo=zone) if ("timezone" in fields or old_start.tzinfo is None) else old_start
+        elif isinstance(old_start, date):
+            new_start = old_start
+        else:
+            raise invalid_field("start", "is required", "Give a date (all-day) or a date-time.")
+        if fields.get("end") is not None and fields.get("duration") is not None:
+            raise invalid_field("end", "give either end or duration, not both")
+        if fields.get("end") is not None:
+            new_end = parse_event_time(fields["end"], zone, "end")
+        elif fields.get("duration") is not None:
+            new_end = new_start + parse_duration_field(fields["duration"])
+        elif not creating and old_bounds.end is not None and type(old_bounds.start) is type(new_start) and "end" not in fields:
+            new_end = new_start + (old_bounds.end - old_bounds.start)  # keep the duration
+        elif not isinstance(new_start, datetime):
+            new_end = new_start + timedelta(days=1)
+        else:
+            raise invalid_field("end", "is required for timed events", "Give `end` or `duration`, e.g. \"duration\": \"PT1H\".")
+        if date_kind(new_end) != date_kind(new_start):
+            raise invalid_field("end", f"must be a {date_kind(new_start)} like start")
+        if new_end <= new_start:
+            hint = "All-day end dates are exclusive: a one-day event on 2026-11-27 ends 2026-11-28." if not isinstance(new_start, datetime) else None
+            raise invalid_field("end", "must be after start", hint)
+        if not creating and isinstance(old_start, date) and type(old_start) is type(new_start):
+            # Keep exclusions and overrides attached to the instances they referred to
+            # by moving them with the series start (in wall-clock terms).
+            old_zone = old_start.tzinfo if isinstance(old_start, datetime) and old_start.tzinfo else zone
+            delta = wall_clock(new_start) - wall_clock(old_start)
+            if "exdates" not in fields:
+                shifted = [shift_wall_clock(item.dt, delta, old_zone, zone) for prop in listify(event.get("EXDATE")) for item in prop.dts]
+                event.pop("EXDATE", None)
+                for value in shifted:
+                    event.add("EXDATE", value)
+            for override in calendar.walk("VEVENT"):
+                rid = decoded_or_none(override, "RECURRENCE-ID")
+                if isinstance(rid, date) and (delta or old_zone != zone):
+                    override.pop("RECURRENCE-ID", None)
+                    override.add("RECURRENCE-ID", shift_wall_clock(rid, delta, old_zone, zone))
+        for name in ("DTSTART", "DTEND", "DURATION"):
+            event.pop(name, None)
+        event.add("DTSTART", new_start)
+        event.add("DTEND", new_end)
+        start_for_rules = new_start
+    else:
+        start_for_rules = old_start if isinstance(old_start, date) else None
+
+    if "summary" in fields:
+        set_property(event, "SUMMARY", fields["summary"])
+    for key, name in (("location", "LOCATION"), ("description", "DESCRIPTION"), ("url", "URL"), ("status", "STATUS")):
+        if key in fields:
+            set_property(event, name, fields[key])
+    if "busy" in fields:
+        set_property(event, "TRANSP", None if fields["busy"] is None else ("OPAQUE" if fields["busy"] else "TRANSPARENT"))
+    if "categories" in fields:
+        set_property(event, "CATEGORIES", fields["categories"] or None)
+    if "rrule" in fields:
+        event.pop("RRULE", None)
+        if fields["rrule"]:
+            if start_for_rules is None:
+                raise invalid_field("rrule", "needs a start")
+            event.add("RRULE", parse_rrule_field(fields["rrule"], start_for_rules))
+    elif time_fields and event.get("RRULE") is not None and start_for_rules is not None:
+        # Re-normalise UNTIL against the new start (DATE vs UTC DATE-TIME).
+        rule = listify(event.get("RRULE"))[0]
+        event.pop("RRULE", None)
+        event.add("RRULE", parse_rrule_field(rule.to_ical().decode("utf-8"), start_for_rules))
+    if "exdates" in fields or fields.get("add_exdates"):
+        if "exdates" in fields:
+            event.pop("EXDATE", None)
+        values = [parse_event_time(value, zone, "exdates") for value in fields.get("exdates") or []]
+        values += [parse_event_time(value, zone, "add_exdates") for value in fields.get("add_exdates") or []]
+        for value in values:
+            if start_for_rules is not None and date_kind(value) != date_kind(start_for_rules):
+                raise invalid_field("exdates", f"{value.isoformat()} must be a {date_kind(start_for_rules)} like start")
+            event.add("EXDATE", value)
+    if "alarms" in fields:
+        from icalendar import Alarm
+
+        event.subcomponents = [sub for sub in event.subcomponents if sub.name != "VALARM"]
+        for spec in fields["alarms"] or []:
+            alarm = Alarm()
+            alarm.add("ACTION", "DISPLAY")
+            alarm.add("DESCRIPTION", spec.get("description") or str(event.get("SUMMARY") or "Reminder"))
+            alarm.add("TRIGGER", timedelta(minutes=-int(spec["minutes_before"])))
+            event.add_component(alarm)
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    set_property(event, "DTSTAMP", now)
+    set_property(event, "LAST-MODIFIED", now)
+    if creating:
+        set_property(event, "CREATED", now)
+        set_property(event, "SEQUENCE", 0)
+    else:
+        set_property(event, "SEQUENCE", int(event.get("SEQUENCE", 0) or 0) + 1)
+
+
+def listify(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+MAPPED_EVENT_PROPERTIES = {
+    "UID", "DTSTAMP", "DTSTART", "DTEND", "DURATION", "SUMMARY", "LOCATION", "DESCRIPTION", "URL", "STATUS",
+    "TRANSP", "CATEGORIES", "RRULE", "EXDATE", "RDATE", "ATTACH", "SEQUENCE", "CREATED", "LAST-MODIFIED",
+}
+
+
+def duration_text(delta: timedelta | None) -> str | None:
+    if delta is None:
+        return None
+    from icalendar import vDuration
+
+    return vDuration(delta).to_ical().decode("ascii")
+
+
+def event_to_json(owner: str, calendar_name: str, path: Path, data: bytes, tz: Any) -> dict[str, Any]:
+    calendar = Calendar.from_ical(data)
+    master = master_event(calendar)
+    bounds = component_bounds(master, tz)
+    managed = {str(record.get("uri")): record for record in event_attachment_records(owner, calendar_name, str(master.get("UID")))}
+    alarms = []
+    for sub in master.subcomponents:
+        if sub.name != "VALARM":
+            continue
+        trigger = decoded_or_none(sub, "TRIGGER")
+        related_end = str(getattr(sub.get("TRIGGER"), "params", {}).get("RELATED", "")).upper() == "END"
+        if isinstance(trigger, timedelta) and trigger <= timedelta(0) and not related_end:
+            alarms.append({"minutes_before": int(-trigger.total_seconds() // 60), "description": component_text(sub, "DESCRIPTION")})
+        else:
+            alarms.append({"trigger": sub["TRIGGER"].to_ical().decode("utf-8") if sub.get("TRIGGER") is not None else None})
+    transp = component_text(master, "TRANSP")
+    categories = [str(item) for prop in listify(master.get("CATEGORIES")) for item in getattr(prop, "cats", [prop])]
+    status = component_text(master, "STATUS")
+    return {
+        "owner": owner,
+        "calendar": calendar_name,
+        "uid": str(master.get("UID", "")),
+        "href": path.name,
+        "etag": compute_etag(data),
+        "summary": component_text(master, "SUMMARY"),
+        "start": ical_value_iso(bounds.start),
+        "end": ical_value_iso(bounds.end),
+        "all_day": bounds.all_day,
+        "timezone": event_zone_name(master) or component_tzid(master),
+        "duration": duration_text(bounds.end_utc - bounds.start_utc) if bounds.start_utc and bounds.end_utc else None,
+        "start_utc": bounds.start_utc.isoformat() if bounds.start_utc else None,
+        "end_utc": bounds.end_utc.isoformat() if bounds.end_utc else None,
+        "location": component_text(master, "LOCATION"),
+        "description": component_text(master, "DESCRIPTION"),
+        "url": component_text(master, "URL"),
+        "status": status.upper() if status else None,
+        "busy": None if transp is None else transp.upper() != "TRANSPARENT",
+        "categories": categories,
+        "rrule": canonical_rrule(master),
+        "exdates": [ical_value_iso(item.dt) for prop in listify(master.get("EXDATE")) for item in prop.dts],
+        "rdates": [ical_value_iso(item.dt) if isinstance(item.dt, date) else str(item.dt) for prop in listify(master.get("RDATE")) for item in prop.dts],
+        "overrides": [
+            {
+                "recurrence_id": ical_value_iso(decoded_or_none(event, "RECURRENCE-ID")),
+                "start": ical_value_iso(component_bounds(event, tz).start),
+                "end": ical_value_iso(component_bounds(event, tz).end),
+                "summary": component_text(event, "SUMMARY"),
+                "status": component_text(event, "STATUS"),
+            }
+            for event in calendar.walk("VEVENT")
+            if event.get("RECURRENCE-ID") is not None
+        ],
+        "alarms": alarms,
+        "attachments": [
+            {
+                "id": managed.get(str(item), {}).get("id"),
+                "uri": None if str(getattr(item, "params", {}).get("VALUE", "")).upper() == "BINARY" else str(item),
+                "filename": getattr(item, "params", {}).get("FILENAME") or managed.get(str(item), {}).get("filename"),
+                "content_type": getattr(item, "params", {}).get("FMTTYPE"),
+            }
+            for item in attach_values(master)
+        ],
+        "sequence": int(master.get("SEQUENCE", 0) or 0),
+        "other_properties": sorted({str(name) for name in master.keys()} - MAPPED_EVENT_PROPERTIES),
+        "last_modified": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat() if path.exists() else None,
+    }
+
+
+def normalize_title(text: str | None) -> str:
+    return " ".join((text or "").casefold().split())
+
+
+def find_duplicate_events(owner: str, calendar_name: str, summary: str | None, start: date, tz: Any, exclude_uid: str | None = None) -> list[dict[str, Any]]:
+    target_title = normalize_title(summary)
+    target_start = to_utc(start, tz)
+    duplicates = []
+    for path in iter_collection_files(owner, calendar_name):
+        item = read_stored_item(path)
+        if item is None or item.calendar is None or not list(item.calendar.walk("VEVENT")):
+            continue
+        master = master_event(item.calendar)
+        if item.uid == exclude_uid or normalize_title(component_text(master, "SUMMARY")) != target_title:
+            continue
+        bounds = component_bounds(master, tz)
+        if bounds.start_utc == target_start:
+            duplicates.append({"uid": item.uid, "href": item.href, "summary": component_text(master, "SUMMARY"), "start": ical_value_iso(bounds.start), "etag": item.etag})
+    return duplicates
+
+
+def check_generated_event(data: bytes, uid: str, baseline: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Validate generated ICS; refuse errors that the request introduced."""
+    report = validate_ics(data, uid)
+    known = {(issue["code"], issue["message"]) for issue in (baseline or {}).get("errors", [])}
+    new_errors = [issue for issue in report["errors"] if (issue["code"], issue["message"]) not in known]
+    if new_errors:
+        raise ApiError(
+            400,
+            "invalid_event",
+            new_errors[0]["message"],
+            hint="Fix the fields named in details.errors and retry.",
+            details={"errors": new_errors},
+        )
+    return report
+
+
+def create_json_event(owner: str, calendar_name: str, payload: EventCreate, dry_run: bool) -> tuple[int, dict[str, Any]]:
+    from icalendar import Event
+
+    fields = payload.model_dump(exclude_unset=True, exclude={"uid", "on_duplicate"})
+    if not payload.summary:
+        raise invalid_field("summary", "is required")
+    if not payload.start:
+        raise invalid_field("start", "is required", "Give a date (all-day) or a date-time.")
+    if payload.add_exdates:
+        raise invalid_field("add_exdates", "is only valid in PATCH; use exdates when creating")
+    uid = payload.uid or str(uuid.uuid4()).upper()
+    if not SEGMENT_RE.fullmatch(uid):
+        raise invalid_field("uid", f"must match {SEGMENT_RE.pattern}")
+    calendar = Calendar()
+    calendar.add("VERSION", "2.0")
+    calendar.add("PRODID", AGENT_PRODID)
+    event = Event()
+    event.add("UID", uid)
+    calendar.add_component(event)
+    apply_event_fields(calendar, event, fields, creating=True)
+    add_missing_vtimezones(calendar)
+    data = calendar.to_ical()
+    report = check_generated_event(data, uid)
+    normalized = prepare_event_body(data, uid)
+    zone = resolve_zone_field(event_zone_name(event) or default_timezone_name())
+    with storage_lock():
+        if read_event(owner, calendar_name, uid) is not None:
+            raise ApiError(409, "uid_exists", f"An event with UID {uid!r} already exists in this calendar",
+                           hint="Use PATCH (or PUT with If-Match) to change it, or omit uid to get a new one.", details={"uid": uid})
+        if payload.on_duplicate != "allow":
+            duplicates = find_duplicate_events(owner, calendar_name, payload.summary, decoded_or_none(event, "DTSTART"), zone)
+            if duplicates and payload.on_duplicate == "error":
+                raise ApiError(409, "duplicate_event", "An event with the same title and start already exists",
+                               hint="Use the existing event (details.duplicates), or retry with on_duplicate=allow if a second copy is intended.",
+                               details={"duplicates": duplicates})
+            if duplicates:
+                found = read_event(owner, calendar_name, duplicates[0]["uid"])
+                assert found is not None
+                return 200, {"created": False, "dry_run": dry_run, "duplicate_of": duplicates[0]["uid"],
+                             "etag": compute_etag(found[1]), "event": event_to_json(owner, calendar_name, found[0], found[1], zone), "warnings": []}
+        path = event_path(owner, calendar_name, uid)
+        if not dry_run:
+            commit_writes([PlannedWrite(owner, calendar_name, uid, path, normalized)], "api")
+    body = {
+        "created": not dry_run,
+        "dry_run": dry_run,
+        "etag": compute_etag(normalized),
+        "event": event_to_json(owner, calendar_name, path, normalized, zone),
+        "warnings": report["warnings"],
+    }
+    return 201 if not dry_run else 200, body
+
+
+def patch_json_event(owner: str, calendar_name: str, uid: str, payload: EventPatch, if_match: str | None, dry_run: bool) -> dict[str, Any]:
+    fields = payload.model_dump(exclude_unset=True)
+    if not fields:
+        raise ApiError(400, "empty_patch", "No fields to change", hint="Send at least one field, e.g. {\"location\": \"Room 2\"}.")
+    with storage_lock():
+        found = read_event(owner, calendar_name, uid)
+        if found is None:
+            raise ApiError(404, "event_not_found", "Event not found", hint="List the calendar (GET .../events?q=...) or search all calendars (GET /api/events?uid=...).")
+        path, data, _stat = found
+        check_write_preconditions(compute_etag(data), if_match, None)
+        calendar = parse_calendar(data)
+        events = list(calendar.walk("VEVENT"))
+        master = next((event for event in events if event.get("RECURRENCE-ID") is None), None)
+        if master is None:
+            raise ApiError(409, "no_series_master", "This resource only holds overrides of a series; edit it with PUT",
+                           hint="GET the ICS, change it, and PUT it back with If-Match.")
+        baseline = validate_ics(data, uid)
+        apply_event_fields(calendar, master, fields, creating=False)
+        add_missing_vtimezones(calendar)
+        updated = calendar.to_ical()
+        report = check_generated_event(updated, uid, baseline)
+        normalized = prepare_event_body(updated, uid)
+        if not dry_run:
+            commit_writes([PlannedWrite(owner, calendar_name, uid, path, normalized)], "api")
+        zone = resolve_zone_field(event_zone_name(master) or default_timezone_name())
+        event = event_to_json(owner, calendar_name, path, normalized, zone)
+    return {"dry_run": dry_run, "etag": compute_etag(normalized), "changed_fields": sorted(fields), "event": event, "warnings": report["warnings"]}
+
+
+AGENT_GUIDE = """# Pocket CalDAV management API: guide for agents
+
+Auth: send `X-API-Key: <key>` on every /api request (except this guide and /healthz).
+CalDAV clients (Apple Calendar, DAVx5) use separate per-user Basic credentials; the key does not work there.
+Full schema: GET /openapi.json. Calendars are addressed as {owner}/{calendar}, e.g. main/personal.
+
+## Conventions
+- Errors: JSON `{"detail": "...", "error": {"code", "message", "hint", "retryable", "details"}}`. Branch on `error.code`, follow `error.hint`.
+- Every event has an `etag`. Send it back as `If-Match` (header) or `if_match` (batch) when changing or deleting, so you never overwrite someone else's edit. A 412 means: re-read, re-apply, retry.
+- Times: date `2026-11-27` = all-day; date-time without offset = wall-clock time in `timezone` (IANA). End is exclusive.
+- Lists page with `limit` + `cursor`; keep following `next_cursor` until `truncated` is false.
+- Writes accept `dry_run=true` to preview without writing.
+
+## Recipes
+Find calendars:            GET /api/calendars
+Search everywhere:         GET /api/events?q=dentist&from=2026-11-01T00:00:00Z&to=2026-12-01T00:00:00Z
+Find every copy of a UID:  GET /api/events?uid=<uid>
+List one calendar:         GET /api/calendars/{owner}/{calendar}/events?from=...&to=...[&expand_recurrence=true]
+Read an event as JSON:     GET /api/calendars/{owner}/{calendar}/{uid}?format=json
+Create (duplicate-safe):   POST /api/calendars/{owner}/{calendar}/events
+                           {"summary": "Dentist", "start": "2026-11-27T15:00", "end": "2026-11-27T16:00", "timezone": "Europe/Berlin"}
+                           -> 201 {event, etag}; 409 error.code=duplicate_event lists the existing copy.
+Weekly series:             {"summary": "Standup", "start": "2026-11-02T09:00", "duration": "PT15M", "timezone": "Europe/Berlin", "rrule": "FREQ=WEEKLY;BYDAY=MO;UNTIL=2027-06-30"}
+Change some fields:        PATCH /api/calendars/{owner}/{calendar}/{uid}  (If-Match: <etag>)  {"start": "2026-11-27T16:00"}  (duration is kept)
+Skip one instance:         PATCH ... {"add_exdates": ["2026-12-21T09:00"]}
+Delete (verifiable):       DELETE /api/calendars/{owner}/{calendar}/{uid} (If-Match: <etag>), then GET .../{uid}/history shows `deleted`
+Several changes at once:   POST /api/batch {"operations": [...]}  (all or nothing)
+What changed since last run: GET /api/changes?since=<next_token>
+Back up before destructive work: GET /api/export?format=zip (manifest.json has SHA-256 per file)
+Attach a file:             POST .../{uid}/attachments (multipart field `file`), verify with GET .../{uid}/attachments
+Raw iCalendar:             GET/PUT .../{uid} with text/calendar; POST /api/validate checks ICS before writing.
+"""
+
+
+
+def query_events(
+    request: Request,
+    response: Response,
+    scopes: list[tuple[str, str]],
+    *,
+    range_from: str | None,
+    range_to: str | None,
+    limit: int,
+    cursor: str | None,
+    expand_recurrence: bool,
+    q: str | None,
+    tz: str | None,
+    uid: str | None = None,
+) -> dict[str, Any]:
+    """Shared implementation of the per-calendar listing and the global search."""
+    start = parse_query_datetime(range_from, "from")
+    stop = parse_query_datetime(range_to, "to")
+    if start and stop and start >= stop:
+        raise ApiError(400, "invalid_range", "from must be before to")
+    if expand_recurrence and stop is None:
+        raise ApiError(400, "missing_to", "expand_recurrence=true requires `to`", hint="Add an exclusive upper bound, e.g. to=2027-01-01T00:00:00Z.")
+    zone_name = tz or default_timezone_name()
+    zone = resolve_timezone(zone_name)
+    fingerprint = hashlib.sha256(
+        json.dumps([scopes, start and start.isoformat(), stop and stop.isoformat(), expand_recurrence, q, zone_name, uid]).encode("utf-8")
+    ).hexdigest()[:16]
+    after_key: tuple[Any, ...] | None = None
+    if cursor:
+        payload = decode_token(cursor, "cursor")
+        key = payload.get("k")
+        if payload.get("f") != fingerprint or not isinstance(key, list) or len(key) != 6:
+            raise ApiError(400, "cursor_mismatch", "cursor does not belong to this query",
+                           hint="Repeat the exact query parameters of the request that returned the cursor.")
+        after_key = tuple(key)
+    entries, invalid = collect_event_entries(
+        scopes, range_from=start, range_to=stop, expand=expand_recurrence, query=q, tz=zone, uid_filter=uid,
+    )
+    remaining = [entry for entry in entries if after_key is None or entry[0] > after_key]
+    page = remaining[:limit]
+    truncated = len(remaining) > limit
+    next_cursor = encode_token({"v": 1, "f": fingerprint, "k": list(page[-1][0])}) if truncated else None
+    if next_cursor:
+        url = request.url.include_query_params(cursor=next_cursor)
+        response.headers["Link"] = f'<{url.path}?{url.query}>; rel="next"'
+    return {
+        "items": [summary for _key, summary in page],
+        "next_cursor": next_cursor,
+        "truncated": truncated,
+        "total": len(entries),
+        "timezone": zone_name,
+        "invalid_items": invalid,
+    }
+
+
+def route_tag(path: str) -> str:
+    if "/attachments" in path:
+        return "attachments"
+    if path.startswith(("/api/changes",)) or path.endswith("/history"):
+        return "sync"
+    if path.startswith("/api/export") or path.endswith("/import"):
+        return "backup"
+    if path in {"/api/calendars", "/api/calendars/{owner}/{calendar_name}"}:
+        return "calendars"
+    if path.startswith(("/api/calendars", "/api/events", "/api/batch", "/api/validate")):
+        return "events"
+    return "system"
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -3323,9 +4153,32 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="Pocket CalDAV",
-        version="1.1.0",
+        version="1.2.0",
+        description="Personal CalDAV server with a management API designed for AI agents. Start with GET /api/guide.",
         lifespan=lifespan,
+        generate_unique_id_function=lambda route: route.name.removeprefix("api_"),
     )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error_handler(request: Request, exc: StarletteHTTPException) -> Response:
+        body = {"detail": exc.detail, "error": error_payload(exc)}
+        return JSONResponse(body, status_code=exc.status_code, headers=getattr(exc, "headers", None))
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError) -> Response:
+        problems = []
+        for issue in exc.errors():
+            location = ".".join(str(part) for part in issue.get("loc", ()) if part != "body")
+            problems.append(f"{location or 'body'}: {issue.get('msg')}")
+        error = {
+            "code": "invalid_request",
+            "message": "; ".join(problems) or "Request validation failed",
+            "status": 422,
+            "retryable": False,
+            "hint": "Fix the listed fields; GET /openapi.json describes every request body.",
+            "details": {"fields": jsonable_encoder(exc.errors(), exclude={"input", "ctx", "url"})},
+        }
+        return JSONResponse({"detail": jsonable_encoder(exc.errors()), "error": error}, status_code=422)
     app.add_middleware(RequestBodyLimitMiddleware, limits=limits)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
 
@@ -3357,7 +4210,8 @@ def create_app() -> FastAPI:
         owner = validate_segment(owner, "owner")
         calendar_name = validate_segment(calendar_name, "calendar")
         if not collection_path(owner, calendar_name).is_dir():
-            raise HTTPException(status_code=404, detail="Calendar not found")
+            raise ApiError(404, "calendar_not_found", "Calendar not found",
+                           hint="GET /api/calendars lists existing calendars; POST /api/calendars creates one.")
         return owner, calendar_name
 
     def next_link(request: Request, param: str, value: str | None) -> dict[str, str]:
@@ -3365,6 +4219,90 @@ def create_app() -> FastAPI:
             return {}
         url = request.url.include_query_params(**{param: value})
         return {"Link": f'<{url.path}?{url.query}>; rel="next"'}
+
+    @app.get("/api/guide", response_class=PlainTextResponse, summary="Usage guide for agents (no auth)")
+    def api_guide() -> PlainTextResponse:
+        """Short task-oriented guide: conventions, error handling, and one call per common task."""
+        return PlainTextResponse(AGENT_GUIDE, media_type="text/markdown")
+
+    @app.get(
+        "/api/calendars",
+        dependencies=[Depends(require_api_key)],
+        response_model=CalendarListResponse,
+        summary="List calendars",
+    )
+    def api_list_calendars() -> dict[str, Any]:
+        return {
+            "calendars": [
+                {**item, "event_count": len(iter_collection_files(item["owner"], item["calendar"]))}
+                for item in list_calendars()
+            ]
+        }
+
+    @app.get(
+        "/api/events",
+        dependencies=[Depends(require_api_key)],
+        response_model=EventListResponse,
+        responses=error_responses(400, 422),
+        summary="Search events across calendars",
+    )
+    def api_search_events(
+        request: Request,
+        response: Response,
+        owner: str | None = Query(None, description="Limit to one owner."),
+        calendar: str | None = Query(None, description="Limit to one calendar (requires owner)."),
+        uid: str | None = Query(None, description="Exact UID: find every copy of an event."),
+        q: str | None = Query(None, max_length=200, description="Case-insensitive substring of SUMMARY, LOCATION or DESCRIPTION."),
+        range_from: str | None = Query(None, alias="from"),
+        range_to: str | None = Query(None, alias="to"),
+        expand_recurrence: bool = Query(False),
+        limit: int = Query(DEFAULT_LIST_LIMIT, ge=1, le=MAX_LIST_LIMIT),
+        cursor: str | None = Query(None),
+        tz: str | None = Query(None),
+    ) -> dict[str, Any]:
+        """Same filters and paging as the per-calendar listing; each item names its owner and calendar.
+        Use `uid=` to prove whether copies of an event exist anywhere.
+        """
+        if owner is not None:
+            owner = validate_segment(owner, "owner")
+        if calendar is not None:
+            calendar = validate_segment(calendar, "calendar")
+            if owner is None:
+                raise ApiError(400, "missing_owner", "calendar requires owner")
+        scopes = [
+            (item["owner"], item["calendar"])
+            for item in list_calendars()
+            if (owner is None or item["owner"] == owner) and (calendar is None or item["calendar"] == calendar)
+        ]
+        return query_events(
+            request, response, scopes,
+            range_from=range_from, range_to=range_to, limit=limit, cursor=cursor,
+            expand_recurrence=expand_recurrence, q=q, tz=tz, uid=uid,
+        )
+
+    @app.post(
+        "/api/calendars/{owner}/{calendar_name}/events",
+        dependencies=[Depends(require_api_key)],
+        status_code=201,
+        response_model=EventWriteResponse,
+        responses={200: {"description": "dry_run, or on_duplicate=return_existing found a match.", "model": EventWriteResponse},
+                   **error_responses(400, 404, 409)},
+        summary="Create an event from JSON",
+    )
+    def api_create_event(
+        owner: str,
+        calendar_name: str,
+        payload: EventCreate,
+        dry_run: bool = Query(False, description="Validate and return the event without storing it."),
+    ) -> JSONResponse:
+        """The server writes valid iCalendar (DTSTAMP, VTIMEZONE, folding) for you.
+
+        Refuses (409 `duplicate_event`) when the calendar already holds an event with the
+        same title (case and spacing ignored) and the same start, unless on_duplicate says otherwise.
+        """
+        owner, calendar_name = require_calendar(owner, calendar_name)
+        status, body = create_json_event(owner, calendar_name, payload, dry_run)
+        return JSONResponse(body, status_code=status, headers={"ETag": body["etag"]})
 
     # Registered before /{uid} so that GET .../events lists the calendar. An event
     # whose UID is literally "events" is still reachable by PUT/DELETE and export.
@@ -3396,47 +4334,11 @@ def create_app() -> FastAPI:
         matching item exactly once even if the calendar changes in between.
         """
         owner, calendar_name = require_calendar(owner, calendar_name)
-        start = parse_query_datetime(range_from, "from")
-        stop = parse_query_datetime(range_to, "to")
-        if start and stop and start >= stop:
-            raise HTTPException(status_code=400, detail="from must be before to")
-        if expand_recurrence and stop is None:
-            raise HTTPException(status_code=400, detail="expand_recurrence=true requires `to`")
-        zone_name = tz or default_timezone_name()
-        zone = resolve_timezone(zone_name)
-        fingerprint = hashlib.sha256(
-            json.dumps([owner, calendar_name, range_from and start.isoformat(), range_to and stop.isoformat(),
-                        expand_recurrence, q, zone_name]).encode("utf-8")
-        ).hexdigest()[:16]
-        after_key: tuple[Any, ...] | None = None
-        if cursor:
-            payload = decode_token(cursor, "cursor")
-            key = payload.get("k")
-            if payload.get("f") != fingerprint or not isinstance(key, list) or len(key) != 4:
-                raise HTTPException(status_code=400, detail="cursor does not belong to this query")
-            after_key = tuple(key)
-        entries, invalid = collect_event_entries(
-            owner,
-            calendar_name,
-            range_from=start,
-            range_to=stop,
-            expand=expand_recurrence,
-            query=q,
-            tz=zone,
+        return query_events(
+            request, response, [(owner, calendar_name)],
+            range_from=range_from, range_to=range_to, limit=limit, cursor=cursor,
+            expand_recurrence=expand_recurrence, q=q, tz=tz,
         )
-        remaining = [entry for entry in entries if after_key is None or entry[0] > after_key]
-        page = remaining[:limit]
-        truncated = len(remaining) > limit
-        next_cursor = encode_token({"v": 1, "f": fingerprint, "k": list(page[-1][0])}) if truncated else None
-        response.headers.update(next_link(request, "cursor", next_cursor))
-        return {
-            "items": [summary for _key, summary in page],
-            "next_cursor": next_cursor,
-            "truncated": truncated,
-            "total": len(entries),
-            "timezone": zone_name,
-            "invalid_items": invalid,
-        }
 
     @app.patch(
         "/api/calendars/{owner}/{calendar_name}",
@@ -3479,7 +4381,7 @@ def create_app() -> FastAPI:
         openapi_extra=ICS_REQUEST_BODY,
         summary="Import a multi-event VCALENDAR",
     )
-    async def api_import(
+    async def api_import_events(
         request: Request,
         owner: str,
         calendar_name: str,
@@ -3588,6 +4490,7 @@ def create_app() -> FastAPI:
         owner: str,
         calendar_name: str,
         uid: str,
+        format: Literal["ics", "json"] = Query("ics", description="`json` returns the structured view used by POST/PATCH."),
         if_none_match: str | None = Header(None),
     ) -> Response:
         owner = validate_segment(owner, "owner")
@@ -3595,12 +4498,45 @@ def create_app() -> FastAPI:
         uid = validate_segment(uid, "uid")
         found = read_event(owner, calendar_name, uid)
         if found is None:
-            raise HTTPException(status_code=404, detail="Event not found")
-        _path, data, stat = found
+            raise ApiError(404, "event_not_found", "Event not found",
+                           hint="Check GET .../{uid}/history to tell a deleted event from one that never existed.")
+        path, data, stat = found
         headers = {"ETag": compute_etag(data), "Last-Modified": http_date(stat.st_mtime)}
         if if_none_match_hits(if_none_match, headers["ETag"]):
             return Response(status_code=304, headers=headers)
+        if format == "json":
+            calendar = Calendar.from_ical(data)
+            zone = resolve_timezone(event_zone_name(master_event(calendar)) or default_timezone_name())
+            return JSONResponse(event_to_json(owner, calendar_name, path, data, zone), headers=headers)
         return PlainTextResponse(data.decode("utf-8"), media_type="text/calendar", headers=headers)
+
+    @app.patch(
+        "/api/calendars/{owner}/{calendar_name}/{uid}",
+        dependencies=[Depends(require_api_key)],
+        response_model=EventPatchResponse,
+        responses=error_responses(400, 404, 409, 412),
+        summary="Change some fields of an event",
+    )
+    def api_patch_event(
+        response: Response,
+        owner: str,
+        calendar_name: str,
+        uid: str,
+        payload: EventPatch,
+        dry_run: bool = Query(False),
+        if_match: str | None = Header(None, description="Recommended: the ETag you last read (412 if it changed)."),
+    ) -> dict[str, Any]:
+        """Omitted fields stay as they are; null removes a field. Changing `start` keeps the
+        duration unless `end`/`duration` is given, and moves EXDATEs and overrides with the
+        series. Properties the JSON view does not model (X- properties, attendees, attachments)
+        are preserved. Applies to the whole series; edit single instances with `add_exdates` or PUT.
+        """
+        owner = validate_segment(owner, "owner")
+        calendar_name = validate_segment(calendar_name, "calendar")
+        uid = validate_segment(uid, "uid")
+        result = patch_json_event(owner, calendar_name, uid, payload, if_match, dry_run)
+        response.headers["ETag"] = result["etag"]
+        return result
 
     @app.delete(
         "/api/calendars/{owner}/{calendar_name}/{uid}",
@@ -3791,7 +4727,7 @@ def create_app() -> FastAPI:
         responses=error_responses(400, 410),
         summary="Change feed",
     )
-    def api_changes(
+    def api_list_changes(
         request: Request,
         response: Response,
         since: str | None = Query(None, description="next_token from an earlier call. Omit to read from the beginning."),
@@ -3838,7 +4774,7 @@ def create_app() -> FastAPI:
         },
         summary="Export or back up calendars",
     )
-    def api_export(
+    def api_export_calendars(
         owner: str | None = Query(None),
         calendar: str | None = Query(None),
         format: Literal["ics", "zip"] = Query("ics"),
@@ -3889,7 +4825,7 @@ def create_app() -> FastAPI:
         responses=error_responses(413),
         summary="Validate an event without storing it",
     )
-    def api_validate(payload: ValidateRequest) -> dict[str, Any]:
+    def api_validate_event(payload: ValidateRequest) -> dict[str, Any]:
         """Checks line syntax and folding, component nesting, UID/DTSTAMP/DTSTART,
         DTEND/DURATION consistency, RRULE parsing, TZIDs without a VTIMEZONE,
         EXDATEs that miss every occurrence, and whether CalDAV clients can load it.
@@ -3938,7 +4874,7 @@ def create_app() -> FastAPI:
         responses=error_responses(400),
         summary="Run attachment cleanup now (destructive)",
     )
-    def api_cleanup(
+    def api_cleanup_attachments(
         confirm: bool = Query(False, description="Required to actually delete."),
         dry_run: bool = Query(False, description="List what would be deleted without deleting."),
     ) -> dict[str, Any]:
@@ -3957,6 +4893,16 @@ def create_app() -> FastAPI:
                 detail="Cleanup deletes attachment files. Pass dry_run=true to preview or confirm=true to run it.",
             )
         return cleanup_attachments(cleaner.ttl_days)
+
+    @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
+    def api_unknown(path: str) -> None:
+        # Without this, unknown /api paths would fall through to the CalDAV server.
+        raise ApiError(404, "unknown_endpoint", f"No endpoint {path!r} for this method",
+                       hint="GET /api/guide lists the common calls; GET /openapi.json has all of them.")
+
+    for route in app.routes:
+        if isinstance(route, APIRoute) and not route.tags:
+            route.tags = [route_tag(route.path)]
 
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/attachments", AttachmentStaticFiles(directory=ATTACHMENTS_DIR), name="attachments")
