@@ -7,3 +7,5 @@ data
 .smoke-data
 .env
 *.log
+tests
+.pytest_cache
