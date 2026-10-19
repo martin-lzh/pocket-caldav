@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # Pull requests cover feature and dev branches; running on their pushes too
+  # would test every commit twice.
   push:
-    branches: [main, dev]
+    branches: [main]
   pull_request:
     branches: [main, dev]
 
